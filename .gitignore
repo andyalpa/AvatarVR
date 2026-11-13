@@ -1,0 +1,18 @@
+.vs/
+.vscode/
+build/
+References/
+_backup/
+third_party/openxr-sdk_1.1.63.zip
+tools/*.exe
+*.log
+*.prev.log
+*.dll
+*.exe
+*.pdb
+*.obj
+
+# tools/re outputs: full tables stay local
+research/sdk/*/raw/
+research/sdk/*/ghidra_headless.log
+__pycache__/
