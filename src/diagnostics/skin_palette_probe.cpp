@@ -195,7 +195,7 @@ std::atomic<unsigned> rig_fallback[4]{};
 std::atomic<unsigned> rig_stale_mm_max{0};
 int rest_anchor_mode=-1;  // rest_mutex: 0 camera bone, 1 root, 2 root axes + camera position
 std::atomic<unsigned> jump_logs{0},cm_fallbacks{0},tick_view_offsets{0};
-struct CleanHandCache { vr_arms_math::HandLocal local; float navi_length=0.f; float shoulder_root[3]{}; bool view_anchor=false; bool valid=false; };
+struct CleanHandCache { vr_arms_math::HandLocal local; float navi_length=0.f; float arm_reach=0.f; float shoulder_root[3]{}; bool view_anchor=false; bool valid=false; };
 CleanHandCache clean_cache[2];  // clean_mutex: the hand layout, Na'vi arm length and the shoulder (root-local, no head shift)
 std::mutex clean_mutex;
 struct GunRecord { long long us=0; float flat[16]{}; float ik[16]{}; float root[16]{}; float view_offset[3]{}; float local[3]{}; std::int16_t cell[3]{}; bool has_local=false; vr_arms::Sample sample; bool valid=false; };
@@ -395,6 +395,18 @@ bool shoulders_follow=true; // FP rig follows the headset's 6DoF offset from the
 skin_arm_ik::ArmScale arm_scale=make_default_scale();                 // menu "Arm scaling" + user measurements (persisted)
 std::atomic<bool> calibrate_request{false};      // menu "Calibrate arm length"
 std::atomic<int> scale_milli[2]{};               // last factor per hand (status log)
+// On-foot reach and elbow (2026-11-13, research/IK_PIPELINE_AUDIT_20261031.md "near-body reach"). [arms] keys hybrid_reach,
+// reach_blend_near, reach_blend_far, soft_reach, elbow_smoothing, elbow_smoothing_ms; 0 = the previous behaviour.
+skin_arm_ik::HybridReach hybrid_reach=[]{skin_arm_ik::HybridReach h; h.enabled=true; return h;}();
+bool soft_reach_on=true;
+bool elbow_smoothing=true;
+float elbow_smoothing_ms=70.f;
+skin_arm_ik::PoleFilter elbow_pole[2];           // pole_mutex
+long long elbow_pole_us[2]{};                    // pole_mutex
+skin_arm_ik::Vec elbow_pole_out[2]{};            // pole_mutex: this frame generation's filtered pole
+unsigned elbow_pole_gen[2]{}; bool elbow_pole_have[2]{};  // pole_mutex
+std::atomic<int> hybrid_w_milli[2]{};            // last hybrid weight per hand (0 = 1:1 with the eyes)
+std::atomic<unsigned> hybrid_solves{0},soft_reach_eases{0},elbow_filtered{0},eye_missing{0};
 std::mutex pole_mutex;
 skin_arm_ik::Vec last_bend[2]{};                 // last solved elbow bend direction per hand (pole continuity)
 // Hand on the gun (2026-10-15, run 21): the controller-driven weapon socket (cell-local, its cell) the game should place
@@ -917,11 +929,25 @@ bool rig_body_read(const void* body,float* out) {
 }
 // The one wrist target of every hand state: free hand, gun hand, support hand and the placed gun. Everything applied here (the
 // one-generation hold on a lost alignment or a jump with a still controller) reaches the gun without a second path.
+// On foot (2026-11-13): eye = the drawn eye centre in the shoulder's space turns on the hybrid reach (1:1 near the body), and
+// arm_reach = upper + forearm length turns on the soft reach limit. Riding passes neither: the mount path is unchanged.
 bool guarded_hand_target(const float* sample16,const float* basis,const float* root,skin_arm_ik::Vec shoulder,float navi_length,unsigned hand,
-                         const vr_arms_math::HandLocal& local,float* wrist16,float* attach16,float* factor,bool* oriented) {
-  bool ok=false;
+                         const vr_arms_math::HandLocal& local,float* wrist16,float* attach16,float* factor,bool* oriented,
+                         const skin_arm_ik::Vec* eye=nullptr,float arm_reach=0.f) {
+  bool ok=false; float weight=1.f;
+  const bool hybrid=eye && hybrid_reach.enabled;
   if(!vr_arms_math::hand_target(sample16,basis,root,shoulder,navi_length,hand,arm_scale,skin_arm_ik::for_hand(hand_tune,hand),
-                                local,wrist16,attach16,factor,&ok)) return false;
+                                local,wrist16,attach16,factor,&ok,hybrid?eye:nullptr,hybrid?&hybrid_reach:nullptr,&weight)) return false;
+  if(hybrid) {hybrid_w_milli[hand].store(static_cast<int>(weight*1000.f),std::memory_order_relaxed); hybrid_solves.fetch_add(1,std::memory_order_relaxed);}
+  if(soft_reach_on && arm_reach>0.f) {
+    const skin_arm_ik::Vec p=skin_arm_ik::position(wrist16);
+    const skin_arm_ik::Vec q=skin_arm_ik::soft_reach_point(p,shoulder,arm_reach);
+    if(skin_arm_ik::finite(q) && skin_arm_ik::length(skin_arm_ik::sub(q,p))>1e-6f) {
+      wrist16[12]=q.x; wrist16[13]=q.y; wrist16[14]=q.z;
+      if(local.attach) skin_arm_ik::multiply_affine(attach16,local.rel,wrist16); else std::memcpy(attach16,wrist16,64);
+      soft_reach_eases.fetch_add(1,std::memory_order_relaxed);
+    }
+  }
   if(oriented) *oriented=ok;
   if(!ok && local.knuckles) {
     rig_align_fails.fetch_add(1,std::memory_order_relaxed);
@@ -1197,7 +1223,10 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
       calibrate_request.store(false);
       char line[260];
       if(t.ok) {
-        arm_scale.user_length=t.length; arm_scale.width=t.width; arm_scale.drop=t.drop; arm_scale.back=t.back; arm_scale.reach=1.f;
+        // [2026-11-13] back < 0 puts the real shoulders in front of the eyes (arms held forward of the body line during the
+        // T-pose); anatomically they sit behind. Clamped to 0 so the 1:1 hybrid region starts from a plausible shoulder.
+        if(t.back<0.f) log("arm calibration: shoulders measured in front of the eyes (arms forward of the body line); back set to 0");
+        arm_scale.user_length=t.length; arm_scale.width=t.width; arm_scale.drop=t.drop; arm_scale.back=std::max(0.f,t.back); arm_scale.reach=1.f;
         // Hand offsets are left alone (hand separation is user-tuned after calibrating).
         std::snprintf(line,sizeof(line),"arm calibration (T-pose) OK: span %.2f m, arm %.2f m, shoulder width %.2f m, drop %.2f m, back %.2f m",
                       t.span,t.length,t.width,t.drop,t.back);
@@ -1231,7 +1260,15 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
         const float navi_length=skin_arm_ik::length(skin_arm_ik::sub(e0,s0))+skin_arm_ik::length(skin_arm_ik::sub(w0,e0))+palm;
         float basis[16]; vr_arms_math::basis_for_root(t_clean.basis,root_matrix,basis);
         float attach16[16],factor=0.f;
-        if(guarded_hand_target(t_clean.local[hand],basis,root_matrix,s0,navi_length,hand,hl,clean_wrist,attach16,&factor,&clean_oriented)) {
+        // On foot: the drawn eye centre (root + this sample's view offset + headset offset), the anchor the shoulders use.
+        const bool on_foot=!mount_camera::rider_view();
+        const bool eye_ok=on_foot && view_height_anchor && t_clean.view_valid && t_clean.head_world_valid;
+        const skin_arm_ik::Vec eye_point{root_matrix[12]+t_clean_view[0]+t_clean.head_world[0],root_matrix[13]+t_clean_view[1]+t_clean.head_world[1],
+                                         root_matrix[14]+t_clean_view[2]+t_clean.head_world[2]};
+        if(on_foot && hybrid_reach.enabled && !eye_ok) eye_missing.fetch_add(1,std::memory_order_relaxed);
+        const float arm_reach=on_foot?skin_arm_ik::length(skin_arm_ik::sub(e0,s0))+skin_arm_ik::length(skin_arm_ik::sub(w0,e0)):0.f;
+        if(guarded_hand_target(t_clean.local[hand],basis,root_matrix,s0,navi_length,hand,hl,clean_wrist,attach16,&factor,&clean_oriented,
+                               eye_ok?&eye_point:nullptr,arm_reach)) {
           clean_done=true; clean_solves.fetch_add(1,std::memory_order_relaxed);
           scale_milli[hand].store(arm_scale.enabled?static_cast<int>(factor*1000.f):0);
           // cache for the gun placement: shoulder in root-local coordinates without the headset shift
@@ -1245,7 +1282,7 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
             float sh[16]{}; sh[0]=sh[5]=sh[10]=sh[15]=1.f; sh[12]=s0.x-head[0]; sh[13]=s0.y-head[1]; sh[14]=s0.z-head[2];
             float shl[16]; skin_arm_ik::multiply_affine(shl,sh,inverse_root0);
             std::lock_guard<std::mutex> lock(clean_mutex);
-            clean_cache[hand].local=hl; clean_cache[hand].navi_length=navi_length;
+            clean_cache[hand].local=hl; clean_cache[hand].navi_length=navi_length; clean_cache[hand].arm_reach=arm_reach;
             clean_cache[hand].shoulder_root[0]=shl[12]; clean_cache[hand].shoulder_root[1]=shl[13]; clean_cache[hand].shoulder_root[2]=shl[14];
             clean_cache[hand].view_anchor=view_anchor; clean_cache[hand].valid=true;
             // health: a hand that jumps > 1 cm in one solve while the controller sample and the body are still
@@ -1490,8 +1527,23 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
       const skin_arm_ik::Vec pole{outward*root_matrix[0]-root_matrix[4]-0.2f*root_matrix[8],
         outward*root_matrix[1]-root_matrix[5]-0.2f*root_matrix[9],outward*root_matrix[2]-root_matrix[6]-0.2f*root_matrix[10]};
       // Elbow continuity: bias towards last frame's bend so a straight raised arm does not flip the elbow inward.
-      const skin_arm_ik::Vec pole_used=prev_valid?skin_arm_ik::add(skin_arm_ik::scale(pole,1.f/std::max(1e-4f,skin_arm_ik::length(pole))),
+      skin_arm_ik::Vec pole_used=prev_valid?skin_arm_ik::add(skin_arm_ik::scale(pole,1.f/std::max(1e-4f,skin_arm_ik::length(pole))),
                                                                  skin_arm_ik::scale(prev_bend,2.f)):pole;
+      // Elbow swivel smoothing (on foot): only the pole is filtered, the wrist target is untouched. One filter step per
+      // frame generation; every mesh drawn in that frame (body, gear) reuses it, so they share one elbow.
+      if(elbow_smoothing && !mount_camera::rider_view()) {
+        const unsigned gen_now=frame_gen.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(pole_mutex);
+        if(!elbow_pole_have[hand] || elbow_pole_gen[hand]!=gen_now) {
+          const long long us=clean_qpc_us();
+          const float dt=elbow_pole_us[hand]?static_cast<float>(us-elbow_pole_us[hand])*1e-6f:0.f;
+          elbow_pole_us[hand]=us;
+          elbow_pole_out[hand]=elbow_pole[hand].step(pole_used,dt,std::clamp(elbow_smoothing_ms,0.f,300.f)*0.001f);
+          elbow_pole_gen[hand]=gen_now; elbow_pole_have[hand]=true;
+          elbow_filtered.fetch_add(1,std::memory_order_relaxed);
+        }
+        pole_used=elbow_pole_out[hand];
+      } else {std::lock_guard<std::mutex> lock(pole_mutex); elbow_pole[hand].primed=false; elbow_pole_have[hand]=false;}
       const bool applied=skin_arm_ik::apply(copy,snapshot,hand,point,pole_used);
       if(applied) {
         const unsigned up=hand?113:14;
@@ -5340,7 +5392,7 @@ std::vector<Setting> settings() {
           {"user_shoulder_width",&arm_scale.width,nullptr},{"user_shoulder_back",&arm_scale.back,nullptr},{"reach_multiplier",&arm_scale.reach,nullptr},
           {"shoulder_separation",&shoulder_spread,nullptr},{"arm_depth_occlusion",nullptr,native_stereo::fp_occlude_menu_flag()},
           {"upper_twist_share",&upper_twist_share,nullptr},{"hand_smoothing",nullptr,&hand_smoothing},{"accessory_physics",nullptr,&accessory_physics},{"rig_coherent",nullptr,&rig_coherent},{"shadow_weapon_follow",nullptr,&shadow_weapon_follow},{"accessory_rigid",nullptr,&accessory_rigid},{"skeleton_anchor_strict",nullptr,&skeleton_anchor_strict},{"shadow_gear_follow",nullptr,&shadow_gear_follow},{"body_arm_shift",&body_arm_shift,nullptr},{"mounted_parity",nullptr,&mounted_parity},{"rider_tick_solve",nullptr,&rider_tick_solve},{"bare_hand_static",nullptr,&bare_hand_static},
-          {"weapon_hand",&weapon_hand_setting,nullptr},{"grips_in_frame_camera",nullptr,&frame_cam},{"model_space_hands",nullptr,&model_space_hands},{"stabilize_hands",nullptr,&hand_stabilize},{"arms_follow_game_tick",nullptr,&tick_resolve},{"body_turn_in_step",nullptr,&root_marker_carry},{"gun_hand_shoulder",nullptr,&shoulder_socket},{"clean_arm_rig",nullptr,&clean_rig},{"left_handed",nullptr,&left_handed},{"vr_controls",nullptr,vr_controls::enabled_flag()},{"mounted_weapon_tracking",nullptr,&mounted_weapon_menu},{"two_hand_aiming",nullptr,&two_hand_enabled},{"gesture_haptics",nullptr,vr_controls::haptics_flag()},{"shoulders_view_height",nullptr,&view_height_anchor},{"arms_lock_to_view",nullptr,&arms_lock_to_view},{"hand_freeze_moving",nullptr,&hand_freeze_moving},{"weapon_trail_comp",&weapon_trail_comp,nullptr},{"empty_hand_gestures",nullptr,hand_gestures::enabled_flag()}};  // "game_hands_follow_ik" removed 2026-10-15 (no effect)
+          {"weapon_hand",&weapon_hand_setting,nullptr},{"grips_in_frame_camera",nullptr,&frame_cam},{"model_space_hands",nullptr,&model_space_hands},{"stabilize_hands",nullptr,&hand_stabilize},{"arms_follow_game_tick",nullptr,&tick_resolve},{"body_turn_in_step",nullptr,&root_marker_carry},{"gun_hand_shoulder",nullptr,&shoulder_socket},{"clean_arm_rig",nullptr,&clean_rig},{"left_handed",nullptr,&left_handed},{"vr_controls",nullptr,vr_controls::enabled_flag()},{"mounted_weapon_tracking",nullptr,&mounted_weapon_menu},{"two_hand_aiming",nullptr,&two_hand_enabled},{"gesture_haptics",nullptr,vr_controls::haptics_flag()},{"shoulders_view_height",nullptr,&view_height_anchor},{"arms_lock_to_view",nullptr,&arms_lock_to_view},{"hand_freeze_moving",nullptr,&hand_freeze_moving},{"weapon_trail_comp",&weapon_trail_comp,nullptr},{"empty_hand_gestures",nullptr,hand_gestures::enabled_flag()},{"hybrid_reach",nullptr,&hybrid_reach.enabled},{"reach_blend_near",&hybrid_reach.near_share,nullptr},{"reach_blend_far",&hybrid_reach.far_share,nullptr},{"soft_reach",nullptr,&soft_reach_on},{"elbow_smoothing",nullptr,&elbow_smoothing},{"elbow_smoothing_ms",&elbow_smoothing_ms,nullptr}};  // "game_hands_follow_ik" removed 2026-10-15 (no effect)
 }
 std::string settings_text() {
   std::string text;
@@ -5396,6 +5448,12 @@ float* user_arm_length_value() { return &arm_scale.user_length; }
 float* user_shoulder_drop_value() { return &arm_scale.drop; }
 float* user_shoulder_width_value() { return &arm_scale.width; }
 float* reach_multiplier_value() { return &arm_scale.reach; }
+bool* hybrid_reach_flag() { return &hybrid_reach.enabled; }
+float* reach_blend_near_value() { return &hybrid_reach.near_share; }
+float* reach_blend_far_value() { return &hybrid_reach.far_share; }
+bool* soft_reach_flag() { return &soft_reach_on; }
+bool* elbow_smoothing_flag() { return &elbow_smoothing; }
+float* elbow_smoothing_ms_value() { return &elbow_smoothing_ms; }
 float* weapon_trail_value() { return &weapon_trail_comp; }
 bool* rig_lock_flag() { return &frame_cam; }
 bool* stabilize_flag() { return &hand_stabilize; }
@@ -5844,7 +5902,12 @@ bool clean_socket(int hand, const vr_arms::Sample& smp, const float* root_tick, 
   float wrist16[16],attach16[16],factor=0.f; bool oriented=false;
   if(rig_coherent) {
     const unsigned holds=hand_holds.load(std::memory_order_relaxed);
-    if(!guarded_hand_target(smp.local[hand],basis,root_tick,shoulder,cache.navi_length,static_cast<unsigned>(hand),cache.local,wrist16,attach16,&factor,&oriented)) return false;
+    // On foot: the same eye anchor as the shoulder (view-anchored root + headset offset), so the gun and the hands share the hybrid reach.
+    const bool on_foot=!mount_camera::rider_view();
+    const bool eye_ok=on_foot && cache.view_anchor && smp.head_world_valid;
+    const skin_arm_ik::Vec eye_point{anchor_tick[12]+smp.head_world[0],anchor_tick[13]+smp.head_world[1],anchor_tick[14]+smp.head_world[2]};
+    if(!guarded_hand_target(smp.local[hand],basis,root_tick,shoulder,cache.navi_length,static_cast<unsigned>(hand),cache.local,wrist16,attach16,&factor,&oriented,
+                            eye_ok?&eye_point:nullptr,on_foot?cache.arm_reach:0.f)) return false;
     if(hand_holds.load(std::memory_order_relaxed)!=holds) rig_gun_holds.fetch_add(1,std::memory_order_relaxed);
   } else if(!vr_arms_math::hand_target(smp.local[hand],basis,root_tick,shoulder,cache.navi_length,static_cast<unsigned>(hand),arm_scale,
                                 skin_arm_ik::for_hand(hand_tune,static_cast<unsigned>(hand)),cache.local,wrist16,attach16,&factor,&oriented))
@@ -6369,7 +6432,13 @@ void on_present() {
       if(rig_now>=rig_next) {rig_next=rig_now+5000; char rig_line[240];
         std::snprintf(rig_line,sizeof(rig_line),"rig audit: coherent=%d holds=%u gun_holds=%u align_lost=%u basis_rejects=%u body_stale=%u far_skips=%u bound_moves=%u twist_unwraps=%u arm_antipodal=%u gear_rigid=%d",
           rig_coherent?1:0,hand_holds.load(),rig_gun_holds.load(),rig_align_fails.load(),vr_arms::basis_rejects(),rig_body_stale.load(),vr_weapon::rig_far_skips(),vr_weapon::rig_bound_moves(),rig_twist_wraps.load(),rig_antipodal.load(),accessory_rigid?1:0);
-        log(rig_line);}}
+        log(rig_line);
+        char reach_line[240];
+        std::snprintf(reach_line,sizeof(reach_line),"reach audit: hybrid=%d near=%.2f far=%.2f w=%.2f,%.2f scale=%.2f,%.2f solves=%u eye_missing=%u soft=%d eases=%u elbow=%d tau_ms=%.0f elbow_steps=%u",
+          hybrid_reach.enabled?1:0,hybrid_reach.near_share,hybrid_reach.far_share,hybrid_w_milli[0].load()*0.001f,hybrid_w_milli[1].load()*0.001f,
+          scale_milli[0].load()*0.001f,scale_milli[1].load()*0.001f,hybrid_solves.load(),eye_missing.load(),soft_reach_on?1:0,soft_reach_eases.load(),
+          elbow_smoothing?1:0,elbow_smoothing_ms,elbow_filtered.load());
+        log(reach_line);}}
     std::snprintf(result,sizeof(result),"palette override mode=%s age_ms=%u delta_y=%.2f applications=%u fp_body=%u accessory=%u weapon=%u wpose=%u/%u grip=%u/%u hand_on_gun=%u/%u gun_frame=%u/%u tick_resolve=%u root_carry=%u shoulder_carry=%u ctrl_delta=%u clean=%d solves=%u gun_place=%u/%u rig_reuse=%u flat_frames=%u hand_jump_still=%u inputs_mismatch=%u cm_fallback=%u tick_view=%u weapon_hand=%d finger_swaps=%u left_pins=%u hand_swaps=%u two_hand=%u/%u w=%.2f lev=%.2f swing=%.1f support_only=%u/%u fp_vs_gun=%u/%u rig_shifts=%u live_grips=%u frame_cam=%u/%u model_hands=%u body_rigid=%u posewrite=%u/%u/%u acc_meshes=%u other211=%u%s%s "
       "mesh=%p grips=%d,%d head=%d %.3f,%.3f,%.3f shoulders=%d scale=%.2f,%.2f user_arm=%.2f rest=%d captures=%u shoulder_h=%.2f shoulder_f=%.2f tune pitch=%.0f yaw=%.0f roll=%.0f fwd=%.2f up=%.2f side=%.2f",
       controller_mode.load()?"controller_ik":"pulse",age,controller_mode.load()?0.f:skin_palette_pulse::offset(age),

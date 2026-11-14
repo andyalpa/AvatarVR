@@ -217,6 +217,92 @@ inline Vec model_hand_point(Vec hmd_rel, const float* basis, unsigned hand, cons
   if (used) *used = 1.f;
   return add(navi_shoulder, sub(hmd_rel, user_shoulder));
 }
+// Hybrid reach (2026-11-13, [AUTHOR] "when I move the arms near my chest or head the hands go beyond"). [LIVE
+// IK_MOTION_TIMING 2026-11-11] the uniform factor was ~1.8 while the eyes are 1:1, so a hand at the face drew ~17 cm above
+// the eye. Near the body the hand is placed 1:1 where the eyes see the real hand (eye + hmd_rel); towards full extension the
+// gain (Na'vi metres per real metre, radially from the shoulder) eases from 1 to a constant G over [near, far] and stays G
+// beyond, with G chosen so a fully stretched real arm still lands where the Na'vi factor K put it. A constant outer gain
+// is the lowest peak gain that reaches K (a smoothstep factor peaked ~4x the hand speed in the blend [unit test 121]).
+// The anchor moves from the user's shoulder (seen 1:1) to the Na'vi shoulder over [near, 1]. The offset is scaled along
+// its own direction, so moving the hand away from the shoulder always moves the target away (no fold-back).
+struct HybridReach {
+  bool enabled = false;
+  float near_share = 0.40f;  // share of the user's arm length (shoulder -> grip) below which the hand is 1:1
+  float far_share = 0.60f;   // share by which the gain has reached its outer value
+};
+inline float smooth01(float e0, float e1, float x) {
+  if (!(e1 > e0)) return x >= e1 ? 1.f : 0.f;
+  const float t = std::clamp((x - e0) / (e1 - e0), 0.f, 1.f);
+  return t * t * (3.f - 2.f * t);
+}
+// Outer gain G for full factor k: k = a + s(1+G)/2 + G(1-a-s), s = far - near.
+inline float hybrid_outer_gain(float k, float a, float s) {
+  const float d = 1.f - a - 0.5f * s;
+  if (!(d > 0.05f) || !std::isfinite(k)) return k;
+  return std::max(1.f, (k - a - 0.5f * s) / d);
+}
+// Mapped radial distance (in user arm lengths) for real distance r: integral of the gain.
+inline float hybrid_radial(float r, float a, float s, float g) {
+  if (r <= a) return r;
+  if (!(s > 1e-4f)) return a + g * (r - a);
+  if (r < a + s) { const float u = (r - a) / s; return r + (g - 1.f) * s * (u * u * u - 0.5f * u * u * u * u); }
+  return a + 0.5f * s * (1.f + g) + g * (r - a - s);
+}
+// weight 0 = 1:1 with the eyes, 1 = the model_hand_point anchor. eye: the drawn eye centre in the space of navi_shoulder.
+inline Vec hybrid_hand_point(Vec hmd_rel, Vec eye, const float* basis, unsigned hand, const ArmScale& a, const HybridReach& h,
+                             Vec navi_shoulder, float navi_length, float* used, float* weight) {
+  const Vec scaled = model_hand_point(hmd_rel, basis, hand, a, navi_shoulder, navi_length, used);
+  if (weight) *weight = 1.f;
+  if (!h.enabled || !finite(eye) || !finite(scaled)) return scaled;
+  float full = used ? *used : 1.f;
+  if (!a.enabled) full = 1.f;
+  if (!std::isfinite(full) || full <= 0.f) full = 1.f;
+  const Vec user_shoulder = real_shoulder(Vec{0.f, 0.f, 0.f}, basis, hand, a);
+  const Vec v = sub(hmd_rel, user_shoulder);
+  const float user_length = std::max(0.3f, a.user_length);
+  const float r = length(v) / user_length;
+  const float near_share = std::clamp(h.near_share, 0.f, 0.95f);
+  const float span = std::min(std::max(h.far_share - near_share, 0.1f), 1.f - near_share);
+  const float g = hybrid_outer_gain(full, near_share, span);
+  const float k = r > 1e-6f ? hybrid_radial(r, near_share, span, g) / r : 1.f;  // this point's factor
+  const float w = smooth01(near_share, 1.f, r);
+  if (weight) *weight = w;
+  if (used) *used = k;
+  const Vec seen_shoulder = add(eye, user_shoulder);  // the real shoulder where the eyes would see it
+  const Vec anchor = add(seen_shoulder, scale(sub(navi_shoulder, seen_shoulder), w));
+  return add(anchor, scale(v, k));
+}
+// Soft reach limit (2026-11-13): a target past ~97% of the arm is eased towards full length instead of clamped, so the
+// elbow does not snap straight. Applied to the wrist target itself, so the gun (placed from the same target) stays on the hand.
+inline float soft_reach(float distance, float limit, float knee_share = 0.03f) {
+  if (!(limit > 0.f) || !std::isfinite(distance)) return distance;
+  const float knee = knee_share * limit, start = limit - knee;
+  if (distance <= start || knee <= 0.f) return distance;
+  return start + knee * (1.f - std::exp(-(distance - start) / knee));
+}
+inline Vec soft_reach_point(Vec target, Vec shoulder, float limit, float knee_share = 0.03f) {
+  const Vec d = sub(target, shoulder);
+  const float l = length(d);
+  if (!(l > 1e-6f)) return target;
+  const float r = soft_reach(l, limit, knee_share);
+  return add(shoulder, scale(d, r / l));
+}
+// Elbow swivel smoothing (2026-11-13, after the Cyberpunk VR port: only the elbow is smoothed). The pole direction is
+// filtered with time constant tau; the wrist is not touched, so the hand gets no extra latency.
+struct PoleFilter {
+  Vec v{0.f, 0.f, 0.f};
+  bool primed = false;
+  Vec step(Vec pole, float dt, float tau) {
+    const float lp = length(pole);
+    if (!(lp > 1e-6f) || !finite(pole)) return pole;
+    const Vec n = scale(pole, 1.f / lp);
+    if (!primed || !(dt > 0.f) || dt > 0.2f || !(tau > 0.f)) { v = n; primed = true; return n; }
+    const Vec m = add(v, scale(sub(n, v), 1.f - std::exp(-dt / tau)));
+    const float lm = length(m);
+    v = lm > 1e-3f ? scale(m, 1.f / lm) : n;
+    return v;
+  }
+};
 // Row-vector rotation part of a 4x4 applied to a direction, and to the axis rows of another matrix (translation kept).
 inline Vec rotate_dir(Vec v, const float* m) {
   return {v.x * m[0] + v.y * m[4] + v.z * m[8], v.x * m[1] + v.y * m[5] + v.z * m[9], v.x * m[2] + v.y * m[6] + v.z * m[10]};

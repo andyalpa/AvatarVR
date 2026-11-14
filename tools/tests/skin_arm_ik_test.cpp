@@ -225,6 +225,80 @@ int main(){
     float rot[16]{}; rot[0]=0; rot[2]=-1; rot[5]=1; rot[8]=1; rot[10]=0; rot[15]=1;  // 90 deg about +y
     const Vec r=rotate_dir(Vec{0,0,1},rot); if(std::fabs(r.x-1.f)>1e-5f || std::fabs(r.z)>1e-5f) return 112;
   }
+  { // Hybrid reach (2026-11-13): geometry of the LIVE Nov 11 trace. Factor ~1.8, Na'vi shoulder 0.19 m below the eye.
+    float basis[16]{}; basis[0]=basis[5]=basis[10]=basis[15]=1.f;  // right +x, up +y, forward +z
+    ArmScale a; a.enabled=true; a.user_length=0.634f; a.width=0.317f; a.drop=0.238f; a.back=0.03f; a.reach=1.15f;
+    const float navi_length=1.8f*0.634f/1.15f;
+    const Vec eye{2.f,10.f,-3.f};
+    const Vec navi_r=add(eye,Vec{0.115f,-0.19f,0.02f}),navi_l=add(eye,Vec{-0.115f,-0.19f,0.02f});
+    HybridReach h; h.enabled=true;
+    float used=0.f,w=0.f;
+    // Off: bit-identical to the model-space point.
+    HybridReach off;
+    const Vec probe{0.1f,-0.1f,0.3f};
+    const Vec m0=model_hand_point(probe,basis,1,a,navi_r,navi_length,&used);
+    const Vec m1=hybrid_hand_point(probe,eye,basis,1,a,off,navi_r,navi_length,&used,&w);
+    if(m0.x!=m1.x||m0.y!=m1.y||m0.z!=m1.z||w!=1.f) return 113;
+    const Vec nan{std::nanf(""),0.f,0.f};  // no eye: old mapping
+    const Vec m2=hybrid_hand_point(probe,nan,basis,1,a,h,navi_r,navi_length,&used,&w);
+    if(m0.x!=m2.x||m0.y!=m2.y||m0.z!=m2.z) return 114;
+    // Hand beside the face: drawn exactly where the eyes see it (old mapping put it ~17 cm too high).
+    const Vec face{0.08f,0.f,0.12f};
+    const Vec at_face=hybrid_hand_point(face,eye,basis,1,a,h,navi_r,navi_length,&used,&w);
+    if(length(sub(at_face,add(eye,face)))>0.01f || w>0.05f) return 115;  // within 1 cm (r = 0.46, ramp start)
+    if(length(sub(model_hand_point(face,basis,1,a,navi_r,navi_length,&used),add(eye,face)))<0.1f) return 116;  // the bug it fixes
+    // Both hands at the sternum meet (old mapping: hand_side kept them >= 36 cm apart; here the points alone).
+    const Vec sr=hybrid_hand_point(Vec{0.02f,-0.30f,0.15f},eye,basis,1,a,h,navi_r,navi_length,&used,&w);
+    const Vec sl=hybrid_hand_point(Vec{-0.02f,-0.30f,0.15f},eye,basis,0,a,h,navi_l,navi_length,&used,&w);
+    if(length(sub(sr,sl))>0.05f || w>0.01f) return 117;
+    // Full stretch forward from the real shoulder: the full Na'vi reach, as before.
+    const Vec us=real_shoulder(Vec{0,0,0},basis,1,a);
+    const Vec full_in=add(us,Vec{0.f,0.f,0.634f});
+    const Vec full=hybrid_hand_point(full_in,eye,basis,1,a,h,navi_r,navi_length,&used,&w);
+    const Vec full_old=model_hand_point(full_in,basis,1,a,navi_r,navi_length,&used);
+    if(length(sub(full,full_old))>1e-4f || w!=1.f || std::fabs(length(sub(full,navi_r))-navi_length*a.reach)>0.002f) return 118;
+    // Rays out of the real shoulder in many directions: the target moves outwards at every 1 mm step, with no jumps.
+    const Vec dirs[]={{0,0,1},{0,1,0},{1,0,0},{-1,0,0},{0,-1,0},{0,0,-1},{0.6f,0.6f,0.53f},{-0.7f,0.3f,0.65f},{0.2f,-0.8f,0.56f},{-0.5f,-0.5f,-0.7f}};
+    for(unsigned hand=0;hand<2;++hand) for(Vec d:dirs) {
+      d=scale(d,1.f/length(d));
+      const Vec ush=real_shoulder(Vec{0,0,0},basis,hand,a);
+      const Vec ns=hand?navi_r:navi_l;
+      Vec last{}; bool have=false;
+      for(int i=20;i<=720;++i) {
+        const Vec in=add(ush,scale(d,i*0.001f));
+        const Vec p=hybrid_hand_point(in,eye,basis,hand,a,h,ns,navi_length,&used,&w);
+        if(!finite(p)) return 119;
+        if(have) {
+          const Vec step=sub(p,last);
+          if(dot(step,d)<=0.f) return 120;               // never folds back
+          if(length(step)>0.001f*3.f) return 121;        // continuous: at most 3x the input step (outer gain 2.6 here)
+        }
+        last=p; have=true;
+      }
+    }
+  }
+  { // Soft reach: unchanged below the knee, continuous, monotone, always short of the limit.
+    if(soft_reach(0.5f,1.f)!=0.5f || soft_reach(0.97f,1.f)!=0.97f) return 122;
+    float prev=soft_reach(0.9f,1.f);
+    for(int i=1;i<=200;++i){  // to 1.1 x limit; further out the steps fall below float resolution
+     const float d=0.9f+i*0.001f,r=soft_reach(d,1.f);
+      if(!(r>prev) || r>=1.f || r-prev>0.0011f) return 123; prev=r;}
+    if(soft_reach(1.f,1.f)<0.985f) return 124;  // within ~1.1 cm of full length at full length
+    const Vec q=soft_reach_point(Vec{0,0,2.f},Vec{0,0,0},1.f);
+    if(std::fabs(q.z-soft_reach(2.f,1.f))>1e-6f || q.x!=0.f) return 125;
+  }
+  { // Elbow pole filter: primes to the input, converges with tau, resets after a gap, ignores a zero pole.
+    PoleFilter f;
+    const Vec a0=f.step(Vec{0,-2.f,0},1.f/72.f,0.07f);
+    if(!near(a0.y,-1.f)) return 126;
+    Vec v{}; for(int i=0;i<3;++i) v=f.step(Vec{1.f,0,0},1.f/72.f,0.07f);
+    if(v.x<0.2f || v.x>0.95f) return 127;                 // moving, not snapped
+    for(int i=0;i<72;++i) v=f.step(Vec{1.f,0,0},1.f/72.f,0.07f);
+    if(!near(v.x,1.f)) return 128;                        // settled within a second
+    v=f.step(Vec{0,0,1.f},0.5f,0.07f); if(!near(v.z,1.f)) return 129;  // gap: reset
+    const Vec z=f.step(Vec{0,0,0},1.f/72.f,0.07f); if(length(z)!=0.f) return 130;
+  }
+  std::puts("hybrid reach: off identical, face and sternum 1:1, full stretch scaled, rays monotone/continuous; soft reach; elbow pole filter pass");
   std::puts("model-space hand: shoulder maps to Na'vi shoulder, reach scaled, unscaled 1:1, direction rotation pass");
   std::puts("accessory spring: rest, lag within clamp, settle, length kept, teleport reset, swing about pivot pass");
   std::puts("pitch level: converges from up/down with normal and inverted stick, deadband, minimum stick, NaN pass");

@@ -1036,6 +1036,18 @@ void build_scripts_tab() {
                 "turning (0 = old lag, 1 = locked to the view). Saved.", Target::None, skin_palette_probe::weapon_trail_value(), 0.f, 1.f, 0.05f, "%.2f"));
   add(t, slider("Reach multiplier", "Fine-tunes how far the Na'vi arms reach for your reach (1.00 = calibrated).", Target::None,
                 skin_palette_probe::reach_multiplier_value(), 0.70f, 1.50f, 0.01f, "%.2f"));
+  add(t, toggle("True hands near body",
+                "On: on foot, hands near your chest and head appear exactly where your real hands are; the Na'vi reach "
+                "scaling only grows as you stretch out. With it on, Reach multiplier 1.00 and Hand separation 0 usually "
+                "fit best. Off: previous behaviour. Saved.", Target::None, skin_palette_probe::hybrid_reach_flag()));
+  add(t, slider("True hands range", "How far out (share of your arm length) hands stay true to your real hands before "
+                "the Na'vi reach takes over. Saved.", Target::None, skin_palette_probe::reach_blend_near_value(), 0.20f, 0.85f, 0.05f, "%.2f"));
+  add(t, toggle("Soft arm reach",
+                "On: on foot, the arm eases into full stretch instead of snapping straight. Saved.", Target::None,
+                skin_palette_probe::soft_reach_flag()));
+  add(t, toggle("Smooth elbows",
+                "On: on foot, the elbow swings smoothly instead of jittering; the hands get no extra delay. Saved.", Target::None,
+                skin_palette_probe::elbow_smoothing_flag()));
   add(t, slider("Shoulder height", "Raises (+) or lowers (-) the Na'vi shoulders, metres.", Target::None,
                 skin_palette_probe::shoulder_height_value(), -0.4f, 0.4f, 0.01f, "%.2f"));
   add(t, slider("Shoulder forward", "Moves the Na'vi shoulders forward (+) or back (-), metres.", Target::None,

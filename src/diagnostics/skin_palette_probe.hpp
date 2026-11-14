@@ -56,6 +56,12 @@ float* user_shoulder_drop_value();   // "Your shoulder drop" (m below the eyes)
 float* user_shoulder_width_value();  // "Your shoulder width" (m)
 float* reach_multiplier_value();     // "Reach multiplier"
 bool* rig_lock_flag();
+bool* hybrid_reach_flag();             // "True hands near body" (on-foot hybrid reach, 2026-11-13)
+float* reach_blend_near_value();
+float* reach_blend_far_value();
+bool* soft_reach_flag();               // "Soft arm reach"
+bool* elbow_smoothing_flag();          // "Smooth elbows"
+float* elbow_smoothing_ms_value();
 bool* stabilize_flag();
 bool* tick_resolve_flag();
 bool* root_carry_flag();

@@ -1988,11 +1988,63 @@ ULONGLONG g_front_seen_at = 0;            // game thread: when the main menu was
 // second view is not built before gameplay. AUTHOR test: does running the 3D main menu in stereo cost gameplay fps?
 std::atomic<bool> g_menu_stereo{true};
 bool g_front_menu_seen = false;           // game thread
+// Back to the main menu from gameplay (2026-11-13). AUTHOR: after quitting to the main menu the panel is gone and the
+// menu follows the head. LIVE 2026-11-13 16:08: pause (main view idle) 16:08:10, quit-to-menu load, main menu with params
+// +0x46 set 16:08:17-26, load, gameplay 16:08:49: the front end had ended at the first load and was never entered again.
+// After a load (params +0x46 clear for kLoadClearMs with the main view rendering) the tracker is armed; params set with
+// the game's virtual cursor on for kSceneOnFrames re-enters the front end (main menu panel). kFrontMenuFrames of params
+// set without the cursor disarm it (gameplay after the load). "nomenureturn" in [native] = off.
+bool g_reentry_armed = false;             // game thread
+int g_reentry_cursor = 0;                 // game thread: params-set frames with the virtual cursor on
+int g_reentry_plain = 0;                  // game thread: params-set frames without it
+ULONGLONG g_reentry_clear_since = 0;      // game thread
+std::atomic<bool> g_menu_return{true};
 int g_front_menu_streak = 0;
 ULONGLONG g_front_clear_since = 0;
 
 void update_front_end(bool live, bool flagged) {
   if (!g_front_end.load(std::memory_order_relaxed)) {
+    if (!g_menu_return.load(std::memory_order_relaxed) || !live) {
+      return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!flagged) {
+      g_reentry_cursor = g_reentry_plain = 0;
+      if (g_reentry_clear_since == 0) {
+        g_reentry_clear_since = now;
+      } else if (!g_reentry_armed && now - g_reentry_clear_since >= kLoadClearMs) {
+        g_reentry_armed = true;
+        log_line("front end: load seen (params +0x46 clear %llu ms); watching for the main menu's virtual cursor",
+                 static_cast<unsigned long long>(now - g_reentry_clear_since));
+      }
+      return;
+    }
+    g_reentry_clear_since = 0;
+    if (!g_reentry_armed) {
+      return;
+    }
+    const ULONGLONG cursor_age = now - menu_pointer::g_native_cursor_at.load(std::memory_order_relaxed);
+    if (cursor_age < 500) {
+      g_reentry_plain = 0;
+      if (++g_reentry_cursor >= kSceneOnFrames) {
+        g_reentry_armed = false;
+        g_reentry_cursor = 0;
+        g_front_end.store(true, std::memory_order_relaxed);
+        g_front_menu_seen = true;
+        g_front_seen_at = now;
+        g_front_clear_since = 0;
+        g_front_menu_streak = 0;
+        log_line("front end: back on the main menu (params +0x46 set, virtual cursor on after a load); main menu panel "
+                 "until the next load");
+      }
+    } else {
+      g_reentry_cursor = 0;
+      if (++g_reentry_plain >= kFrontMenuFrames) {
+        g_reentry_armed = false;
+        g_reentry_plain = 0;
+        log_line("front end: gameplay after the load (no virtual cursor for 4 s); main menu watch off until the next load");
+      }
+    }
     return;
   }
   if (live && flagged) {
@@ -2036,6 +2088,9 @@ void update_front_end(bool live, bool flagged) {
              "load, waiting for the main menu again", static_cast<unsigned long long>(kLoadClearMs));
   } else if (now - g_front_clear_since >= kLoadClearMs) {
     g_front_end.store(false, std::memory_order_relaxed);
+    g_reentry_armed = true;  // this load may lead to gameplay or back to a menu; the cursor decides
+    g_reentry_clear_since = 0;
+    g_reentry_cursor = g_reentry_plain = 0;
     log_line("front end: load after the main menu (params +0x46 clear %llu ms, main view rendering); HUD placement from here",
              static_cast<unsigned long long>(now - g_front_clear_since));
   }
@@ -2062,6 +2117,40 @@ bool g_off_by_pause = false;             // game thread: the gate closed because
 std::atomic<std::uint64_t> g_quick_resumes{0};
 const char* g_rebuild_reason = "rebuild requested";
 
+// Fast travel (AUTHOR 2026-11-13: the cave's dark right eye comes back only after fast travelling there). LIVE
+// 2026-11-08 18:51:52-18:52:09: the gate closed with the main view idle (the map), stayed idle through the 17 s load and
+// took the quick pause-menu resume, so the kept second view came back without a rebuild (DARK RIGHT samples followed).
+// A pause menu does not move the camera; a load somewhere else does. So the main camera position is kept when the gate
+// closes, and a resume more than kTeleportUnits away counts as a load. "noteleport" in [native] turns this off.
+constexpr float kTeleportUnits = 25.f;
+std::atomic<bool> g_teleport_rebuild{true};
+bool g_off_pos_valid = false;  // game thread
+float g_off_pos[3] = {};
+
+bool main_camera_pos(float* out3) {
+  if (g_helpers[kHDescCopy].fn == nullptr) {
+    return false;
+  }
+  void* cam = nullptr;
+  if (!read_ptr(static_cast<unsigned char*>(g_views[0].view) + kCameraOffset, &cam) || cam == nullptr) {
+    return false;
+  }
+  if (cam == g_priv_left && g_created_main_cam != nullptr) {
+    cam = g_created_main_cam;  // head mode: the game camera, not our left-eye camera
+  }
+  float m[16];
+  if (!ff_read_matrix(cam, m)) {
+    return false;
+  }
+  for (int k = 0; k < 3; ++k) {
+    if (!std::isfinite(m[12 + k])) {
+      return false;
+    }
+    out3[k] = m[12 + k];
+  }
+  return true;
+}
+
 bool update_scene_gate(bool live) {
   if (g_view_count.load() == 0) {
     return false;
@@ -2075,6 +2164,7 @@ bool update_scene_gate(bool live) {
   const bool settle = g_load_settle.load(std::memory_order_relaxed);
   if (!on && live && !flagged) {
     g_off_by_pause = false;  // a loading screen or the front end since the gate closed: no quick resume
+    g_load_seen = true;      // ... and a load after a menu (map -> fast travel) still rebuilds on resume
   }
   if (set == on) {
     g_scene_streak = 0;
@@ -2091,8 +2181,23 @@ bool update_scene_gate(bool live) {
              set ? "GAMEPLAY -> stereo allowed" : "menu / start-up -> mono", flag, live ? "rendering" : "idle", need);
     if (!set) {
       g_off_by_pause = !live;
-    } else if (need == kResumeOnFrames) {
-      g_quick_resumes.fetch_add(1, std::memory_order_relaxed);
+      g_off_pos_valid = main_camera_pos(g_off_pos);
+    } else {
+      if (need == kResumeOnFrames) {
+        g_quick_resumes.fetch_add(1, std::memory_order_relaxed);
+      }
+      float p[3];
+      if (g_off_pos_valid && main_camera_pos(p)) {
+        const float dx = p[0] - g_off_pos[0], dy = p[1] - g_off_pos[1], dz = p[2] - g_off_pos[2];
+        const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const bool moved = d > kTeleportUnits && g_teleport_rebuild.load(std::memory_order_relaxed);
+        log_line("scene gate: camera moved %.1f units while mono%s", d,
+                 moved && !g_load_seen ? " -> counted as a load (fast travel): second view rebuilt" : "");
+        if (moved) {
+          g_load_seen = true;
+        }
+      }
+      g_off_pos_valid = false;
     }
     if (!set && live && !flagged) {
       g_load_seen = true;  // loading screen (not a pause menu)
@@ -6988,6 +7093,8 @@ void poll() {
         g_head.store(c != nullptr && std::strstr(text, "head") != nullptr);
         g_scene_gate_on.store(std::strstr(text, "anyscene") == nullptr);
         g_load_settle.store(std::strstr(text, "nosettle") == nullptr);  // on by default (settle after loads)
+        g_teleport_rebuild.store(std::strstr(text, "noteleport") == nullptr);  // on by default (fast travel rebuild, 2026-11-13)
+        g_menu_return.store(std::strstr(text, "nomenureturn") == nullptr);  // on by default (2026-11-13)
         {
           const bool menu_stereo = std::strstr(text, "nomenustereo") == nullptr;
           if (g_menu_stereo.exchange(menu_stereo) != menu_stereo) {

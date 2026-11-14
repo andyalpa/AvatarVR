@@ -54,6 +54,15 @@ std::atomic<int> grab_events{0};  // + grabs, logged by the Present thread
 struct GrabLog { int hand, edge; float distance; bool learned; };
 GrabLog grab_log[8]; std::atomic<unsigned> grab_log_n{0};
 std::atomic<bool> fp_enabled{true};
+// [HEADSET 2026-11-13] riding with a bow, holding the trigger to tense makes the arms jiggle as riding did before. [LIVE
+// RIDER_TRACE_36848500] in bursts the eye (C_head of the 192 pose + calibrated eye) moved unevenly in world (off-trend per step p50 2.2,
+// p90 9.4 cm; steps 13-25 cm) while the body (+0x94) stayed even (0.5 cm; 15-20 cm); calm: eye 0.4/0.7 cm. The hands are built on this
+// eye, the meshes on the body ticks, so the arms jiggled. INFERENCE: the pose is sometimes a tick older than the body read. The body is
+// read in the pose's own pelvis frame (bone 6): that offset is near constant while riding and jumps when the pose lags; its median of 5
+// steps, smoothed as on foot smooths camera sway (0.25 s, height 0.10 s), shifts the eye by (body - pelvis frame at the smoothed offset).
+// Head-to-pelvis and the pelvis turn come from one pose, so tilt is not lagged. eye_pose_steady=0 in AvatarVR_mounts.txt turns it off.
+std::atomic<bool> eye_pose_steady{true};
+std::atomic<unsigned> eye_steady_mm{0},eye_steady_steps{0};
 mount_anchor::Anchor anchor;  // game thread (head step)
 long long anchor_us = 0;      // game thread
 std::atomic<bool> anchor_on{false};
@@ -377,6 +386,7 @@ void load() {
   arms_menu = saved_arms = settings.mounted_arms;
   arms_enabled.store(arms_menu);
   fp_enabled.store(first_person);
+  eye_pose_steady.store(std::string_view(text, n).find("eye_pose_steady=0") == std::string_view::npos);
   auto_capture = settings.auto_capture;
   if (auto_capture) requested.store(true);
   log(std::string("build " __DATE__ " " __TIME__ "; first-person mounts (stage A eye anchor) ") +
@@ -586,6 +596,9 @@ void on_present() {
     if (on && GetTickCount64() >= next_rider_log) {
       next_rider_log = GetTickCount64() + 5000;
       const auto c = skin_palette_probe::rider_counters();
+      {char e[160]; std::snprintf(e, sizeof(e), "eye pose steady: on=%d steps=%u correction_max=%u mm",
+         eye_pose_steady.load(std::memory_order_relaxed) ? 1 : 0, eye_steady_steps.load(std::memory_order_relaxed),
+         eye_steady_mm.exchange(0, std::memory_order_relaxed)); log(e);}
       char b[256];
       std::snprintf(b, sizeof(b), "rider: arm_apps=%u rest_solves=%u (rest captures %u) self_solves=%u ref_solves=%u "
                     "mismatch=%u (max %d mm, last joint %d) no_grip=%u anchored_bones=%u head_hidden=%u arms_toggle=%d "
@@ -653,6 +666,37 @@ bool eye_anchor(const float* cam_pos, float* delta3) {
                  std::isfinite(bone[12]) && std::isfinite(bone[13]) && std::isfinite(bone[14]);
     for (int k = 0; k < 3; ++k) in.bone[k] = bone[12 + k];
     anchor_source.store(0, std::memory_order_relaxed);
+  }
+  {  // eye_pose_steady (see its declaration)
+    static float history[5][3]{}; static unsigned history_n = 0; static float steady[3]{}; static bool steady_have = false;
+    float pelvis[16]{}, q[3]{};
+    const bool use = in.wanted && in.body_ok && in.bone_ok && head_ok && eye_pose_steady.load(std::memory_order_relaxed) &&
+                     tp_bone(p, 6, pelvis) && mount_anchor::to_local(pelvis, in.body, q);
+    if (!use) { steady_have = false; history_n = 0; }
+    else {
+      std::memcpy(history[history_n++ % 5], q, sizeof(q));
+      const unsigned count = std::min(history_n, 5u);
+      float median[3];
+      for (int k = 0; k < 3; ++k) {
+        float v[5]; for (unsigned i = 0; i < count; ++i) v[i] = history[i][k];
+        std::sort(v, v + count); median[k] = v[count / 2];
+      }
+      float jump = 0.f; for (int k = 0; k < 3; ++k) jump += (median[k] - steady[k]) * (median[k] - steady[k]);
+      if (!steady_have || !(jump < 0.5f * 0.5f)) { std::memcpy(steady, median, sizeof(steady)); steady_have = true; }
+      else for (int k = 0; k < 3; ++k) {
+        const float tau = k == 1 ? 0.10f : 0.25f;
+        steady[k] += (1.f - std::exp(-in.dt / tau)) * (median[k] - steady[k]);
+      }
+      float at[3]; mount_anchor::to_world(pelvis, steady, at);
+      float c[3], len = 0.f; for (int k = 0; k < 3; ++k) { c[k] = in.body[k] - at[k]; len += c[k] * c[k]; }
+      len = std::sqrt(len);
+      if (std::isfinite(len) && len < 0.5f) {
+        for (int k = 0; k < 3; ++k) in.bone[k] += c[k];
+        eye_steady_steps.fetch_add(1, std::memory_order_relaxed);
+        const unsigned mm = static_cast<unsigned>(len * 1000.f); unsigned seen = eye_steady_mm.load(std::memory_order_relaxed);
+        while (mm > seen && !eye_steady_mm.compare_exchange_weak(seen, mm, std::memory_order_relaxed)) {}
+      }
+    }
   }
   record_harness(p, s.phase == mount_state::Phase::Riding && s.camera_mode != 4);
   update_grab(p, s.phase != mount_state::Phase::None && s.camera_mode != 4 && anchor_on.load(std::memory_order_relaxed) &&

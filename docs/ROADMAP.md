@@ -17,6 +17,7 @@ Native same-frame stereo, 6DoF head tracking, stable decoupled head pitch, OpenX
 - [x] Changing VR resolution in the pause/main menu prevents returning to 3D VR
 - [ ] Native stick cursor appearance and hover alignment
 - [ ] Flat screen follows the head; flat flashes between loading and stereo gameplay
+- [ ] Right eye dark (ambient light lost) after fast travel to the cave
 - [ ] Motion-controller menu pointer
 
 ## Planned features

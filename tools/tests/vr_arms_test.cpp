@@ -65,6 +65,22 @@ int main() {
   if (!close(wr[12] - wl[12], 0.36f, 1e-3f)) return 13;  // mirrored side: 2 x 0.18 m apart along body right
   if (!close(al[14], wl[14] + 0.1f)) return 14;           // attach still rigid to the wrist
 
+  // 5b. hybrid reach (2026-11-13): near the body the wrist is eye + hmd_rel with the hand offsets faded out; without an
+  //     eye (riding) the result is bit-identical to the old call; the socket stays rigid to the wrist.
+  {skin_arm_ik::ArmScale s2; s2.enabled = true; s2.user_length = 0.634f; s2.width = 0.317f; s2.drop = 0.238f; s2.back = 0.03f; s2.reach = 1.15f;
+    skin_arm_ik::HybridReach hy; hy.enabled = true;
+    float near_s[16]; identity(near_s); near_s[12] = 0.08f; near_s[13] = 0.f; near_s[14] = 0.12f;  // beside the face
+    const Vec eye_pt{1.f, 3.f, -2.f}, sh{1.115f, 2.81f, -1.98f};
+    float wa[16], aa[16], wb[16], ab[16], wgt = 0.f;
+    if (!hand_target(near_s, id, id, sh, 0.99f, 1, s2, rt, local, wa, aa, &factor, &oriented, &eye_pt, &hy, &wgt)) return 60;
+    if (wgt > 0.05f || !close(wa[12], 1.08f, 0.01f) || !close(wa[13], 3.f, 0.01f) || !close(wa[14], -1.88f, 0.01f)) return 61;  // within 1 cm  // side 0.18 faded out
+    if (!close(aa[14], wa[14] + 0.1f)) return 62;
+    hand_target(near_s, id, id, sh, 0.99f, 1, s2, rt, local, wb, ab, &factor, &oriented);
+    float wc[16], ac[16];
+    hand_target(near_s, id, id, sh, 0.99f, 1, s2, rt, local, wc, ac, &factor, &oriented, nullptr, &hy, &wgt);
+    for (int i = 0; i < 16; ++i) if (wb[i] != wc[i] || ab[i] != ac[i]) return 63;
+    if (close(wb[13], wa[13], 0.1f)) return 64;}  // the old mapping is far off here (the bug)
+
   // 6. mirrored hold: proper rotation (det +1), mirrored twice = identity, the hand moves to the other side of the gun.
   {float h[16]; yaw_matrix(h, 0.4f); h[12] = 0.06f; h[13] = -0.05f; h[14] = -0.12f;  // right wrist right of / below the socket
     float m[16], mm[16]; mirror_hold(h, m); mirror_hold(m, mm);

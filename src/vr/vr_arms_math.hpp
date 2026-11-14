@@ -205,11 +205,16 @@ struct HandLocal {
 // (world or cell-local; the caller is consistent). Returns false only on non-finite input.
 inline bool hand_target(const float* sample16, const float* basis16, const float* root16, Vec shoulder, float navi_length,
                         unsigned hand, const skin_arm_ik::ArmScale& scale, const skin_arm_ik::HandTune& tune,
-                        const HandLocal& local, float* wrist16, float* attach16, float* factor, bool* oriented) {
+                        const HandLocal& local, float* wrist16, float* attach16, float* factor, bool* oriented,
+                        const Vec* eye = nullptr, const skin_arm_ik::HybridReach* hybrid = nullptr, float* weight = nullptr) {
   float grip[16];
   to_world(sample16, basis16, grip);
   const Vec hmd_rel{grip[12], grip[13], grip[14]};
-  const Vec p = skin_arm_ik::model_hand_point(hmd_rel, root16, hand, scale, shoulder, navi_length, factor);
+  float w = 1.f;
+  const Vec p = (eye && hybrid)
+      ? skin_arm_ik::hybrid_hand_point(hmd_rel, *eye, root16, hand, scale, *hybrid, shoulder, navi_length, factor, &w)
+      : skin_arm_ik::model_hand_point(hmd_rel, root16, hand, scale, shoulder, navi_length, factor);
+  if (weight) *weight = w;
   if (!skin_arm_ik::finite(p)) return false;
   grip[12] = p.x; grip[13] = p.y; grip[14] = p.z;
   std::memcpy(wrist16, local.wrist, 16 * sizeof(float));
@@ -217,7 +222,10 @@ inline bool hand_target(const float* sample16, const float* basis16, const float
   bool ok = false;
   if (local.knuckles) ok = skin_arm_ik::align_hand(wrist16, target, local.middle, local.index, local.pinky, grip, tune);
   if (!ok) { std::memcpy(wrist16, local.wrist, 16 * sizeof(float)); target = p; }
-  const Vec point = skin_arm_ik::body_offset(target, root16, tune);
+  // Hybrid reach: the hand offsets compensated for the old mapping; they fade out where the hand is 1:1 (weight 0).
+  skin_arm_ik::HandTune offsets = tune;
+  if (w < 1.f) { offsets.side *= w; offsets.up *= w; offsets.forward *= w; }
+  const Vec point = skin_arm_ik::body_offset(target, root16, offsets);
   if (!skin_arm_ik::finite(point)) return false;
   wrist16[12] = point.x; wrist16[13] = point.y; wrist16[14] = point.z; wrist16[15] = 1.f;
   if (local.attach) skin_arm_ik::multiply_affine(attach16, local.rel, wrist16);
