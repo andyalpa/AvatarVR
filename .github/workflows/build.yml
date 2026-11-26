@@ -48,4 +48,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create $env:RELEASE_TAG dist/AvatarVR-win-x64.zip dist/AvatarVR-win-x64.zip.sha256 -R $env:GITHUB_REPOSITORY --verify-tag --generate-notes
+        run: |
+          $files = 'dist/AvatarVR-win-x64.zip', 'dist/AvatarVR-win-x64.zip.sha256'
+          gh release view $env:RELEASE_TAG -R $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # A release written by hand on GitHub keeps its text; just attach the build.
+            gh release upload $env:RELEASE_TAG @files -R $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $env:RELEASE_TAG @files -R $env:GITHUB_REPOSITORY --verify-tag --generate-notes
+          }
+          exit $LASTEXITCODE
