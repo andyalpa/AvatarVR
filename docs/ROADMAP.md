@@ -7,35 +7,35 @@ Native same-frame stereo, 6DoF head tracking, stable decoupled head pitch, OpenX
 ## Known issues
 
 - [ ] Wavy, shadow-like artifact follows moving IK body, weapon and NPCs in the right eye only
-- [ ] IK hands draw in front of nearer objects/body (arm depth occlusion regressed)
-- [ ] Decoupled pitch occasionally snaps the view fully up or down
+- [x] IK hands draw in front of nearer objects/body (arm depth occlusion regressed)
+- [x] Decoupled pitch occasionally snaps the view fully up or down
 - [x] Main menu and gameplay HUD centering
-- [ ] X-ray scan disrupts the 3D view; animal/plant/environment highlights are off-center
-- [ ] Distant shadows differ between the eyes
+- [x] X-ray scan disrupts the 3D view; animal/plant/environment highlights are off-center
+- [x] Distant shadows differ between the eyes
 - [x] Sharpness slider
 - [ ] Performance is currently too heavy
 - [x] Changing VR resolution in the pause/main menu prevents returning to 3D VR
 - [ ] Native stick cursor appearance and hover alignment
-- [ ] Flat screen follows the head; flat flashes between loading and stereo gameplay
+- [x] Flat screen follows the head; flat flashes between loading and stereo gameplay
 - [ ] Right eye dark (ambient light lost) after fast travel to the cave
-- [ ] Motion-controller menu pointer
+- [x] Motion-controller menu pointer
 
 ## Planned features
 
-- [ ] Roomscale
-- [ ] Raycast weapon aiming
-- [ ] IK arms
-- [ ] Hand gestures and finger movement
+- [x] Roomscale
+- [x] Raycast weapon aiming
+- [x] IK arms
+- [x] Hand gestures and finger movement
 - [ ] Manual reload
-- [ ] First-person mounts
+- [x] First-person mounts
 - [ ] Physical bow shooting and arrow tension
 - [ ] World-scale slider
 - [ ] Holsters
 - [ ] Grenade throwing
-- [ ] Two-handed weapon handling
+- [x] Two-handed weapon handling
 - [ ] Physical melee
-- [ ] Selected HUD elements on the body
-- [ ] Weapon recoil on the tracked arms and gun
-- [ ] In-world reticle on the weapon raycast
+- [x] Selected HUD elements on the body
+- [x] Weapon recoil on the tracked arms and gun
+- [x] In-world reticle on the weapon raycast
 
 `[x]` = done and checked in the headset. `[ ]` = open (may already have partial code behind a menu toggle).
