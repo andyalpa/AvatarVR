@@ -77,6 +77,35 @@ Everything above could use more polish. Watch for right-eye artifacts, uneven li
 
 To uninstall, delete `scripts/AvatarVR.dll`.
 
+### Recommended settings
+
+These are the settings I've been playing with on an RTX 4090 and a Quest 3 over Virtual Desktop. They're a starting point, not a rule. If you find something that runs better, please share it.
+
+**In the game's options**
+
+| Setting | Value | Why |
+|---|---|---|
+| Display mode | Windowed, 1280×720 | The headset image doesn't depend on the window size, so a small window saves work |
+| Graphics preset | Low, then adjust | Every eye is rendered at the full headset resolution, so the usual presets cost far more than they do on a monitor |
+| Upscaler | DLSS, Performance | Quality looks sharper but cost me about 4.5 ms per frame (around 51 fps instead of 58) |
+| Frame generation (game) | Off | The game's frame generation only reaches the monitor, not the headset. Use the mod's instead. |
+| Ray reconstruction | Off | |
+| Motion blur, chromatic aberration, vignette | Off | These are uncomfortable in VR, and the headset lenses add their own distortion |
+| Frame rate limit | Off | |
+| Reduce latency | Off | |
+
+Ray tracing can't be fully turned off. The game hung on the loading screen when I forced it off in the config file, so leave it at the lowest option the menu allows.
+
+**In the mod menu (F10)**
+
+- **Headset → Frame generation (mod)**: On. The game renders at roughly 45–60 fps and the mod fills in the frames in between, so head motion stays smooth at 90 Hz.
+- **View → Eye resolution scale**: Start at the default and lower it one step at a time if it still feels choppy. In my testing, going to 100% eye resolution added about 3.8 ms per frame.
+
+**Outside the game**
+
+- **Virtual Desktop**: I use the Godlike quality setting with AV1. The video stream ends up narrower than what the game renders, so it limits sharpness more than the game settings do.
+- **Close overlays and recorders.** Razer Cortex, the Ubisoft overlay, browser windows and anything that records or streams the screen all compete for the GPU. Closing them took me from about 58 fps to 75 fps in the same spot.
+
 ### Controls and tuning
 
 - **Menu**: **F10** opens and closes the mod menu. Arrow keys and Enter select, Page Up and Page Down switch tabs. You can also point at it with your controllers. **F9** saves a stereo screenshot.
