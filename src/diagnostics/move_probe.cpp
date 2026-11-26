@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "move_probe.hpp"
 #include "../game/mount_state.hpp"
 #include "../game/player.hpp"
@@ -295,10 +296,7 @@ void __fastcall update_detour(void* p) {
 }
 
 void log(const char* line) {
-  HANDLE file=CreateFileW((dir+L"\\MOVE_PROBE.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if (file==INVALID_HANDLE_VALUE) return;
-  DWORD n; WriteFile(file,line,static_cast<DWORD>(std::strlen(line)),&n,nullptr); WriteFile(file,"\r\n",2,&n,nullptr);
-  CloseHandle(file);
+  runtime_log::append(dir+L"\\MOVE_PROBE.log", {line, "\r\n"});
 }
 void csv(const std::string& text,bool truncate) {
   HANDLE file=CreateFileW((dir+L"\\MOVE_PROBE.csv").c_str(),truncate?GENERIC_WRITE:FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,
@@ -388,10 +386,7 @@ void finish() {
 }
 
 void nudge_log(const char* line) {
-  HANDLE file=CreateFileW((dir+L"\\MOVE_NUDGE.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if (file==INVALID_HANDLE_VALUE) return;
-  DWORD n; WriteFile(file,line,static_cast<DWORD>(std::strlen(line)),&n,nullptr); WriteFile(file,"\r\n",2,&n,nullptr);
-  CloseHandle(file);
+  runtime_log::append(dir+L"\\MOVE_NUDGE.log", {line, "\r\n"});
 }
 void nudge_drain() {
   static NudgeRec pending[64];  // present thread only
@@ -418,10 +413,7 @@ void nudge_drain() {
   }
 }
 void room_log(const char* line) {
-  HANDLE file=CreateFileW((dir+L"\\MOVE_ROOMSCALE.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if (file==INVALID_HANDLE_VALUE) return;
-  DWORD n; WriteFile(file,line,static_cast<DWORD>(std::strlen(line)),&n,nullptr); WriteFile(file,"\r\n",2,&n,nullptr);
-  CloseHandle(file);
+  runtime_log::append(dir+L"\\MOVE_ROOMSCALE.log", {line, "\r\n"});
 }
 bool control_read=false;  // the control file has been polled at least once (present thread)
 // Whole-word match ("on" must not match inside other words).

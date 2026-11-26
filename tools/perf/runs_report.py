@@ -7,6 +7,7 @@ GPU_MONITOR.log (utilisation, encoder sessions, other programs on the GPU) and, 
 (game settings, power plan). Nothing is launched or written. Frame rates are 2 s averages logged by the mod, not
 individual frames. A run needs at least 5 stereo samples to be listed.
 """
+from session_log import read_channel
 import re
 import statistics as st
 import sys
@@ -24,7 +25,7 @@ KEYS = ("reduceLatency", "maxFramerate", "customFPSLimit", "nvReflex")
 
 def read(path):
     try:
-        return path.read_text(errors="replace").splitlines()
+        return read_channel(path).splitlines()
     except OSError:
         return []
 
@@ -80,7 +81,9 @@ def summarize(folder):
 
 
 def main():
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"H:\Gaming\UbisoftLibrary\AFOP\scripts\runs")
+    if len(sys.argv) != 2:
+        raise SystemExit("Usage: runs_report.py <runs-directory>")
+    root = Path(sys.argv[1])
     folders = sorted(p for p in root.iterdir() if p.is_dir())
     folders.append(root.parent)                      # the live logs of the latest run
     seen, rows = set(), []

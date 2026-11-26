@@ -122,6 +122,15 @@ bool weapon_attach_matrices(int hand, float (&flat)[16], float (&ik)[16]);
 bool held_weapon_drawn();  // a named weapon mesh was drawn in hand within 200 ms, under either weapon placement path
 // The held bow's C_arrow_01 / C_root / C_bowString palette matrices as drawn, world; false when no bow drew in 200 ms (read-only).
 bool drawn_arrow(float (&arrow)[16],float (&bow_root)[16],float (&string)[16],bool* have_string,char (&path)[96],char (*bow)[96]=nullptr);
+// FEATURE-07: the bow limb mesh (with its string) drawn within 200 ms: C_bowString / its C_arrow_01 / C_root, world.
+bool held_bow(float (&string)[16],float (&arrow)[16],float (&root)[16],char (&bow)[96]);
+// FEATURE-07: the support (non-weapon) controller's wrist target, world, measured by the on-foot solve within 150 ms
+// (needs Two-hand aiming on; not while riding).
+bool support_wrist_world(int hand,float (&p)[3]);
+bool support_wrist_matrix(int hand,float (&m)[16]);  // FEATURE-05: the support wrist target as a world matrix (rotation + position)
+bool support_point_world(int hand,float (&p)[3]);  // FEATURE-05: the native two-hand support point, world (same frame as support_wrist_world)
+float handle_point_distance(int hand);   // FEATURE-05: wrist to the trigger handle (m), 1e9 unknown
+float support_point_distance(int hand);  // FEATURE-05: wrist to the two-hand support point (m), 1e9 unknown
 std::string arrow_report();  // log only: arrow/bow captures since the last call, and the angle between their C_arrow_01 +Z; resets
 bool held_weapon_root(float (&out)[16]);  // flat (animated) C_root of the in-hand weapon, world; false if stale (200 ms)
 unsigned rider_hidden_builds();  // FEATURE-06: head/hair palette builds collapsed while the eyes ride on the head

@@ -35,6 +35,7 @@ Native same-frame stereo, 6DoF head tracking, stable decoupled head pitch, OpenX
 - [ ] Two-handed weapon handling
 - [ ] Physical melee
 - [ ] Selected HUD elements on the body
+- [ ] Weapon recoil on the tracked arms and gun
 - [ ] In-world reticle on the weapon raycast
 
 `[x]` = done and checked in the headset. `[ ]` = open (may already have partial code behind a menu toggle).

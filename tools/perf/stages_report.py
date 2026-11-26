@@ -7,6 +7,7 @@ windows before that log line and after it are averaged separately and compared (
 the delta column shows which stages grow with resolution. "runs/frame ~2" usually means the stage runs once per eye.
 Stage time is GPU time between a run's timestamps: it includes overlap with earlier unfinished work (attribution).
 """
+from session_log import read_channel
 import argparse
 import re
 from collections import defaultdict
@@ -56,7 +57,7 @@ def main():
     p = Path(a.path)
     if p.is_dir():
         p = p / "DX12_OBSERVE.log"
-    ws = [w for w in windows(p.read_text(errors="replace").splitlines()) if w[1] > 6.0]
+    ws = [w for w in windows(read_channel(p, "DX12_OBSERVE").splitlines()) if w[1] > 6.0]
     if a.series is not None:
         # Settings sweep: a setting change shows as a step in its stages (and in busy) between two windows.
         print("window  line   busy   span  " + "  ".join(f"{s[:14]:>14s}" for s in a.series))

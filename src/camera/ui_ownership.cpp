@@ -1,3 +1,5 @@
+#include <sstream>
+#include "../settings_file.hpp"
 #include "ui_ownership.hpp"
 #include "native_stereo.hpp"
 #include "mount_camera.hpp"
@@ -5,6 +7,7 @@
 #include "../vr/wrist_hud.hpp"
 #include "../vr/xr_runtime.hpp"
 #include "../vr/vr_weapon.hpp"
+#include "../vr/vr_recoil.hpp"
 #include <windows.h>
 #include <MinHook.h>
 #include <algorithm>
@@ -298,12 +301,13 @@ void read_placements() {
   if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&install),&self)) {
     const DWORD length=GetModuleFileNameW(self,path,MAX_PATH);
     std::wstring file(path,length); const auto slash=file.find_last_of(L"\\/");
-    FILE* f=nullptr;
-    if (length && length<MAX_PATH && slash!=std::wstring::npos && _wfopen_s(&f,(file.substr(0,slash+1)+L"AvatarVR_hud_widgets.txt").c_str(),L"rb")==0 && f) {
-      char line[96];
-      while (std::fgets(line,sizeof(line),f)) {
+    std::string text;
+    if (length && length<MAX_PATH && slash!=std::wstring::npos &&
+        settings_file::read(file.substr(0,slash+1)+L"AvatarVR_hud_widgets.txt", text)) {
+      std::istringstream input(text);
+      for (std::string line; std::getline(input, line);) {
         char element[24]{},field_name[16]{}; float value=0.f;
-        if (std::sscanf(line,"%23[^.].%15[^=]=%f",element,field_name,&value)!=3 || !std::isfinite(value)) continue;
+        if (std::sscanf(line.c_str(),"%23[^.].%15[^=]=%f",element,field_name,&value)!=3 || !std::isfinite(value)) continue;
         if (!std::strcmp(element,"settings") && !std::strcmp(field_name,"frame")) { skin_palette_probe::set_hud_frame_method(static_cast<int>(value)); arm_method.store(static_cast<int>(value)); continue; }
         for (int i=0;i<ElementCount;++i) if (!std::strcmp(element,Elements[i].key)) {
           auto& n=next[i];
@@ -315,13 +319,12 @@ void read_placements() {
           else if (!std::strcmp(field_name,"shrink")) n.shrink=value;
         }
       }
-      std::fclose(f);
     }
     // One bone list per process for the wizard, once the game's names are known.
     static bool names_written=false;
     if (!names_written && length && length<MAX_PATH && slash!=std::wstring::npos && !skin_palette_probe::hud_bone_name(0).empty()) {
       FILE* out=nullptr;
-      if (_wfopen_s(&out,(file.substr(0,slash+1)+L"AvatarVR_hud_bones.txt").c_str(),L"wb")==0 && out) {
+      if (_wfopen_s(&out,(file.substr(0,slash+1)+L"AvatarVR\\state\\AvatarVR_hud_bones.txt").c_str(),L"wb")==0 && out) {
         for (int i=0;i<211;++i) { const auto name=skin_palette_probe::hud_bone_name(i); if (!name.empty()) std::fprintf(out,"%d=%s\n",i,name.c_str()); }
         std::fclose(out); names_written=true;
       }
@@ -429,6 +432,7 @@ bool arm_frames() {
       } else {
         float shot_origin[3],shot_forward[3];
         if (!pose.hand_ok[weapon_hand] || !vr_weapon::shot_aim(shot_origin,shot_forward,&shot_distance)) continue;
+        if (!vr_weapon::held_is_bow()) vr_recoil::unkick_ray(weapon_hand,shot_origin,shot_forward);  // the drawn wrist kicks, the mark does not
         const float* wrist=pose.wrist_axes[weapon_hand];
         for (int r=0;r<3;++r) {
           start[r]=pose.wrist[weapon_hand][r]; way[r]=0.f;
@@ -613,23 +617,22 @@ std::wstring beside_dll(const wchar_t* name) {
 }
 void read_fx() {
   FxEffect next[FxMax]={FxDefault};
-  FILE* f=nullptr;
+  std::string text;
   const auto path=beside_dll(L"AvatarVR_fullview_fx.txt");
-  if (!path.empty() && _wfopen_s(&f,path.c_str(),L"rb")==0 && f) {
+  if (!path.empty() && settings_file::read(path, text)) {
     // Fields a line leaves out keep the default (older tuners wrote other fields); entries with no line at all are off.
     FxEffect parsed[FxMax]; bool listed[FxMax]{}; bool any=false;
     for (auto& n:parsed) n=FxDefault;
-    char line[64];
-    while (std::fgets(line,sizeof(line),f)) {
+    std::istringstream input(text);
+    for (std::string line; std::getline(input, line);) {
       unsigned i=0; char field_name[16]{}; float value=0.f;
-      if (std::sscanf(line,"effect%u.%15[^=]=%f",&i,field_name,&value)!=3 || i>=FxMax || !std::isfinite(value)) continue;
+      if (std::sscanf(line.c_str(),"effect%u.%15[^=]=%f",&i,field_name,&value)!=3 || i>=FxMax || !std::isfinite(value)) continue;
       any=listed[i]=true;
       auto& n=parsed[i];
       if (!std::strcmp(field_name,"x")) n.x=value; else if (!std::strcmp(field_name,"y")) n.y=value;
       else if (!std::strcmp(field_name,"on")) n.on=value; else if (!std::strcmp(field_name,"strength")) n.strength=value;
       else if (!std::strcmp(field_name,"size")) n.size=value;
     }
-    std::fclose(f);
     // An empty file (LIVE 2026-11-07: 0 bytes from the tuner) keeps the default instead of turning every effect off.
     if (any) { for (int i=0;i<FxMax;++i) if (!listed[i]) parsed[i].on=0.f; std::memcpy(next,parsed,sizeof(next)); }
   }
@@ -659,7 +662,7 @@ int fx_match(void* widget) {
 }
 void write_fx_seen() {
   FILE* f=nullptr;
-  const auto path=beside_dll(L"AvatarVR_fullview_seen.txt");
+  const auto path=beside_dll(L"AvatarVR\\state\\AvatarVR_fullview_seen.txt");
   if (path.empty() || _wfopen_s(&f,path.c_str(),L"wb")!=0 || !f) return;
   for (auto& seen:fx_seen) if (const int code=seen.load(std::memory_order_relaxed)) std::fprintf(f,"%d,%d\n",code/16384-4096,code%16384-4096);
   std::fclose(f);

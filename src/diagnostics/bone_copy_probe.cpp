@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "bone_copy_probe.hpp"
 #include "../game/player.hpp"
 #include <windows.h>
@@ -37,11 +38,7 @@ bool tried=false,on=false,installed=false;
 ULONGLONG last_poll=0;
 
 void log(const char* line) {
-  HANDLE file=CreateFileW((dir+L"\\BONE_COPY_PROBE.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if (file==INVALID_HANDLE_VALUE) return;
-  DWORD n;
-  WriteFile(file,line,static_cast<DWORD>(std::strlen(line)),&n,nullptr);
-  WriteFile(file,"\r\n",2,&n,nullptr); CloseHandle(file);
+  runtime_log::append(dir+L"\\BONE_COPY_PROBE.log", {line, "\r\n"});
 }
 
 void __fastcall pack_detour(void* owner,void* target) {

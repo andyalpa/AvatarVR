@@ -208,13 +208,20 @@ void* Pick_hook(void* root,const float* point) {
 }
 
 namespace {
-// Read-only crash receipt, scripts\CRASH_TRACE.log: every first-chance fault up to a limit, so the last line before a silent
+// Read-only crash receipt, scripts\AvatarVR.log ([CRASH_TRACE]): every first-chance fault up to a limit, so the last line before a silent
 // death names the code. Faults the game or the mod's own __try reads handle appear here too. An exit line = no fault killed it.
 HANDLE g_trace=INVALID_HANDLE_VALUE;
 std::atomic<unsigned> g_trace_lines{0};
 void trace_text(const char* text,int n) {
-  DWORD done=0;
-  if (g_trace!=INVALID_HANDLE_VALUE && n>0) WriteFile(g_trace,text,static_cast<DWORD>(n),&done,nullptr);
+  if (g_trace == INVALID_HANDLE_VALUE || n <= 0) return;
+  constexpr char tag[] = "[CRASH_TRACE] ";
+  char line[320];
+  constexpr auto prefix = static_cast<int>(sizeof(tag) - 1);
+  if (n > 255) n = 255;
+  std::memcpy(line, tag, prefix);
+  std::memcpy(line + prefix, text, n);
+  DWORD done = 0;
+  WriteFile(g_trace, line, static_cast<DWORD>(prefix + n), &done, nullptr);
 }
 LONG CALLBACK fault_trace(EXCEPTION_POINTERS* e) {
   const DWORD code=e->ExceptionRecord->ExceptionCode;
@@ -265,8 +272,9 @@ void fault_trace_install() {
       !GetModuleFileNameA(own,path,MAX_PATH)) return;
   char* slash=std::strrchr(path,'\\');
   if (!slash || static_cast<size_t>(slash-path)+20>=MAX_PATH) return;
-  std::strcpy(slash+1,"CRASH_TRACE.log");
-  g_trace=CreateFileA(path,GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+  std::memcpy(slash + 1, "AvatarVR.log", sizeof("AvatarVR.log"));
+  g_trace=CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (g_trace==INVALID_HANDLE_VALUE) return;
   char head[96];
   trace_text(head,std::snprintf(head,sizeof(head),"game base %p, tick %llu\r\n",g_base,static_cast<unsigned long long>(GetTickCount64())));

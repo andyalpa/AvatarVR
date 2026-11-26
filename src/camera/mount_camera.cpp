@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "mount_camera.hpp"
 #include "mount_camera_capture.hpp"
 #include "mount_anchor.hpp"
@@ -141,10 +142,7 @@ bool write(HANDLE file, const std::string& s) {
   return file != INVALID_HANDLE_VALUE && WriteFile(file, s.data(), static_cast<DWORD>(s.size()), &n, nullptr) && n == s.size();
 }
 void log(const std::string& s) {
-  const HANDLE file = CreateFileW((dir + L"\\MOUNT_CAMERA.log").c_str(), FILE_APPEND_DATA,
-                                FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  write(file, s + "\r\n");
-  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  runtime_log::append(dir + L"\\MOUNT_CAMERA.log", {s});
 }
 void queue(std::string s) {  // mutex held; never write files on an engine hook thread
   if (pending.size() < kQueueLimit) pending.push_back({std::move(s)});
@@ -537,7 +535,7 @@ void on_present() {
     grab_log_n.store(0, std::memory_order_release);
   }
   if (harness_report.exchange(false)) {
-    // Ride ended: the grip learned so far (pelvis axes: right, up, forward) goes to the log and AvatarVR_harness.txt.
+    // Ride ended: the grip learned so far (pelvis axes: right, up, forward) goes to the runtime log.
     std::string text;
     {
       std::lock_guard<std::mutex> lock(harness_mutex);
@@ -553,10 +551,6 @@ void on_present() {
     log("harness grip (game riding pose, pelvis frame):\r\n" + text.substr(0, text.size() - 2));
     const std::string frames = skin_palette_probe::rider_frame_report();
     log("harness frame census (palms in each nearby mesh's frame; smallest spread first):\r\n" + frames.substr(0, frames.size() - 2));
-    const HANDLE file = CreateFileW((dir + L"\\AvatarVR_harness.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    write(file, "# FEATURE-06 harness grip: 192-pose palm in the rider pelvis frame (metres; rows right, up, forward)\r\n" + text);
-    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
   }
   {
     mount_state::Transition t[8];

@@ -1,0 +1,51 @@
+name: Windows build
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure, build and test
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G 'Visual Studio 18 2026' -A x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Package
+        shell: pwsh
+        run: tools/package.ps1 -BuildDir build -OutputDir dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: AvatarVR-win-x64
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: AvatarVR-win-x64
+          path: dist
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create $env:RELEASE_TAG dist/AvatarVR-win-x64.zip dist/AvatarVR-win-x64.zip.sha256 -R $env:GITHUB_REPOSITORY --verify-tag --generate-notes

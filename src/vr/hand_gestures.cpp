@@ -1,3 +1,5 @@
+#include "../runtime_log.hpp"
+#include "../settings_file.hpp"
 #include "hand_gestures.hpp"
 #include "hand_gesture_pose.hpp"
 #include "hand_gesture_context_audit.hpp"
@@ -138,8 +140,6 @@ void log_audit(const Audit& a) {
     GetModuleFileNameW(self,file,MAX_PATH); std::wstring s=file;
     return s.substr(0,s.find_last_of(L"\\/"))+L"\\HAND_GESTURES.log";
   }();
-  const HANDLE f=CreateFileW(path.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if(f==INVALID_HANDLE_VALUE) return;
   char text[2200];
   auto masks=[](const Sensors& s,bool supported) {
     const Signal* fields[]={&s.grip,&s.trigger,&s.index_touch,&s.thumb_touch,&s.thumb_press};
@@ -163,7 +163,7 @@ void log_audit(const Audit& a) {
     a.context.verified,a.context.cinematic,a.native.active,a.native.archetype,a.native.transition_state,a.native.camera_override,
     a.native.equipment,a.native.held,static_cast<int>(a.context.owner[0]),static_cast<int>(a.context.owner[1]),
     a.weight[0],a.weight[1],applications.load(std::memory_order_relaxed),rejections.load(std::memory_order_relaxed));
-  DWORD wrote=0; if(n>0) WriteFile(f,text,static_cast<DWORD>(std::min<int>(n,sizeof(text)-1)),&wrote,nullptr); CloseHandle(f);
+  if(n>0) runtime_log::append(path, {std::string_view(text, std::min<int>(n,sizeof(text)-1))});
 }
 } // namespace
 bool* enabled_flag() {return &menu_enabled;}
@@ -182,11 +182,7 @@ void on_present() {
       runtime_dir=runtime_dir.substr(0,runtime_dir.find_last_of(L"\\/"));
     }
     FILE* f=nullptr;std::string text;
-    if(_wfopen_s(&f,(runtime_dir+L"\\AvatarVR_ik_tune.txt").c_str(),L"rb")==0 && f) {
-      char bytes[4096];std::size_t size=0;
-      while((size=std::fread(bytes,1,sizeof(bytes),f))>0 && text.size()<1048576) text.append(bytes,size);
-      std::fclose(f);
-    }
+    settings_file::read(runtime_dir + L"\\AvatarVR_ik_tune.txt", text);
     static std::string prior;static bool initialized=false;
     if(!initialized || text!=prior) {
       initialized=true;prior=text;Tuning next=parse_gesture_tune(text);
@@ -200,7 +196,7 @@ void on_present() {
       capture_request.store(live && !captured.ready?settings.capture_hand:-1,std::memory_order_release);
       if(captured.ready && !captured.written) {
         captured.written=true;
-        const std::wstring path=runtime_dir+L"\\AvatarVR_gesture_capture.json";
+        const std::wstring path=runtime_dir+L"\\AvatarVR\\state\\AvatarVR_gesture_capture.json";
         if(_wfopen_s(&f,(path+L".tmp").c_str(),L"wb")==0 && f) {
           static const char* fingers[]={"thumb","index","middle","pinky"};
           std::fprintf(f,"{\"id\":%.17g,\"at\":%.3f,\"hand\":\"%s\",\"context\":\"%s\",\"position_mm\":%.3f,\"angle_deg\":%.3f,"
@@ -224,7 +220,7 @@ void on_present() {
     Audit copy;Frame pose;
     {std::lock_guard<std::mutex> lock(mutex);copy=audit;pose=published;}
     // Tuner reads status only; this file never drives gameplay or skeleton writes.
-    if(_wfopen_s(&f,(runtime_dir+L"\\AvatarVR_gesture_status.json").c_str(),L"wb")==0 && f) {
+    if(_wfopen_s(&f,(runtime_dir+L"\\AvatarVR\\state\\AvatarVR_gesture_status.json").c_str(),L"wb")==0 && f) {
       std::fprintf(f,"{\"at\":%.3f,\"moving\":%d,\"mounted\":%d,\"context_ready\":%d,\"native_owned\":%d,"
         "\"owners\":[%d,%d],\"weight\":[%.3f,%.3f],\"combo\":[%d,%d],"
         "\"grip\":[%.3f,%.3f],\"trigger\":[%.3f,%.3f],\"index_touch\":[%.0f,%.0f],"
@@ -289,25 +285,34 @@ bool calibrate(HandReference& out,const float (*mats)[16],unsigned n,const char*
   HMODULE self=nullptr;wchar_t file[MAX_PATH]{};
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&calibrate),&self);
   GetModuleFileNameW(self,file,MAX_PATH);std::wstring path=file;
-  path=path.substr(0,path.find_last_of(L"\\/"))+L"\\AvatarVR_hand_references.txt";
+  path=path.substr(0,path.find_last_of(L"\\/"))+L"\\AvatarVR\\state\\AvatarVR_hand_references.txt";
   char key[64];
   std::snprintf(key,sizeof(key),"%016llx %u %d %d ",static_cast<unsigned long long>(rig_hash(names,n)),n,mounted?1:0,hand);
   std::lock_guard<std::mutex> lock(file_mutex);
   if(!loaded) {
-    loaded=true;std::string text;FILE* f=nullptr;
-    if(_wfopen_s(&f,path.c_str(),L"rb")==0 && f) {
-      char bytes[4096];std::size_t size=0;
-      while((size=std::fread(bytes,1,sizeof(bytes),f))>0) text.append(bytes,size);
-      std::fclose(f);
-    }
+    loaded=true;std::string text;settings_file::read(path, text);
     std::istringstream all(text);std::string line;
     while(std::getline(all,line)) if(!line.empty()) lines.push_back(line);
   }
   unsigned entries=0;
+  std::vector<HandReference> saved_list;std::vector<float> errors;
   for(const auto& line:lines) if(!line.compare(0,std::strlen(key),key)) {
     ++entries;HandReference saved=fresh_reference;
-    if(reference_from_text(line.substr(std::strlen(key)),saved) && reference_fits(saved,mats,n)) {out=std::move(saved);return true;}
+    const bool parsed=reference_from_text(line.substr(std::strlen(key)),saved);
+    errors.push_back(parsed?reference_fit_error(saved,mats,n):1e9f);
+    saved_list.push_back(std::move(saved));
   }
+  const int chosen=choose_saved_reference(errors.data(),static_cast<int>(errors.size()));
+  {  // Which saved reference each load used: one line per calibration in HAND_GESTURES.log.
+    std::string text="hand_reference rig="+std::string(key,16)+" bones="+std::to_string(n)+" mounted="+(mounted?"1":"0")+
+      " hand="+std::to_string(hand)+" entries="+std::to_string(entries)+" chosen="+std::to_string(chosen)+" fit_errors=";
+    char e[24];
+    for(float v:errors) {std::snprintf(e,sizeof(e),"%.3f,",v<1e8f?v:-1.f);text+=e;}
+    text+=chosen>=0?" loaded\r\n":allow_new?" new\r\n":" none\r\n";
+    const std::wstring log_path=path.substr(0,path.rfind(L"\\AvatarVR\\state\\"))+L"\\HAND_GESTURES.log";
+    runtime_log::append(log_path, {text});
+  }
+  if(chosen>=0) {out=std::move(saved_list[chosen]);return true;}
   if(!allow_new) return false;
   out=fresh_reference;
   if(entries<8) { // distinct mesh proportions sharing one skeleton; bounded

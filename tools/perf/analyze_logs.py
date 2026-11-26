@@ -3,6 +3,7 @@
 Percentiles describe logged reporting-window averages, NOT individual frames.
 GPU fence latency and Present-to-Present residuals are not execution timings.
 """
+from session_log import read_channel
 import argparse
 import hashlib
 import json
@@ -159,13 +160,23 @@ def analyze(folder, hz=72, tail=120):
         raise ValueError("hz and tail must be positive")
     files = {}
     texts = {}
+    combined = folder / "AvatarVR.log"
+    if combined.is_file():
+        raw = combined.read_bytes()
+        files[combined.name] = {"path": str(combined.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                                "mtime_unix": combined.stat().st_mtime}
     for name in ("DX12_OBSERVE.log", "XR_RUNTIME.log", "DLSS_TWIN.log", "NATIVE_STEREO.log", "AvatarVR_settings.ini", "AvatarVR.dll"):
         path = folder / name
+        if name.endswith(".log"):
+            try:
+                texts[name] = read_channel(path)
+            except FileNotFoundError:
+                pass
         if path.is_file():
             raw = path.read_bytes()
             files[name] = {"path": str(path.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
                            "mtime_unix": path.stat().st_mtime}
-            if path.suffix != ".dll":
+            if not name.endswith(".log") and path.suffix != ".dll":
                 texts[name] = raw.decode("utf-8", errors="replace")
     windows, queues, memory = parse_dx12(texts.get("DX12_OBSERVE.log", ""))
     transport = parse_transport(texts.get("XR_RUNTIME.log", ""))
@@ -202,8 +213,8 @@ def main():
     args = parser.parse_args()
     if args.hz <= 0 or args.tail <= 0:
         parser.error("--hz and --tail must be positive")
-    if not (args.scripts / "DX12_OBSERVE.log").is_file():
-        parser.error("scripts folder must contain DX12_OBSERVE.log")
+    if not any((args.scripts / name).is_file() for name in ("AvatarVR.log", "DX12_OBSERVE.log")):
+        parser.error("scripts folder must contain AvatarVR.log or DX12_OBSERVE.log")
     result = analyze(args.scripts, args.hz, args.tail)
     payload = json.dumps(result, indent=2) + "\n"
     if args.output:

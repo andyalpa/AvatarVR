@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // Optional per-eye depth for the headset layer (2026-11-12, ISSUE-05; "xrdepth" in [xr], default off).
-// Frame-generation layers (VectorXR) and runtimes can use depth submitted with XR_KHR_composition_layer_depth to keep
+// Frame-generation layers and runtimes can use depth submitted with XR_KHR_composition_layer_depth to keep
 // near detail (hands, gun) steady in generated frames. Source: the game's DLSS input depth (render resolution,
 // reverse-Z, R32G8X24_TYPELESS), copied at each view's DLSS evaluate (dlss_twin.cpp) into a private buffer; at the
 // game's Present (xr_runtime.cpp copy_present) a small pass writes it, resampled to the eye size, into a D32_FLOAT

@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "skin_palette_probe.hpp"
 #include "skin_palette_pulse_math.hpp"
 #include "skin_arm_ik.hpp"
@@ -23,6 +24,10 @@
 #include "../vr/mounted_hand_pose.hpp"
 #include "../vr/mounted_weapon_profiles.hpp"
 #include "../vr/vr_weapon_math.hpp"
+#include "../vr/vr_recoil.hpp"
+#include "../vr/bow_draw.hpp"
+#include "../vr/reload_probe.hpp"
+#include "../vr/manual_reload.hpp"
 #include <windows.h>
 #include <intrin.h>
 #include <MinHook.h>
@@ -71,7 +76,7 @@ skin_arm_ik::HandTune hand_tune=make_default_tune();
 bool forearm_twist=true; // spread the wrist's twist over the lowerArm_twist bones
 bool body_anchor=true;   // shift grip targets by the body's movement since the grips were sampled
 std::atomic<unsigned> frame_gen{1};  // advances on Present (moved up: used by the solve and the weapon draw)
-// [AUTHOR run 35] Model-space hands (Cyberpunk VR port style, `VRIK_BuildHandTarget`): the hand target is the controller
+// [AUTHOR run 35] Model-space hands: the hand target is the controller
 // relative to the headset of the same sample (bob/position cancel), rotated into the drawn frame, minus the user's
 // calibrated shoulder offset, scaled and added to a body-fixed Na'vi shoulder (rest pose anchored to the FP root, not
 // the camera bone). Replaces the compensation layers (body anchor, yaw delta, frame-camera re-expression, stabilize,
@@ -159,7 +164,7 @@ std::atomic<unsigned> body_arm_shift_mm[2]{};  // read-only: largest body arm-ch
 // was placed. Riding (SOURCE): each draw chose its own input and body, gear took the draw-time body while the body arms took the solve's,
 // and gun palettes followed the live palm while the entity-placed parts stayed at the commit. mounted_parity 0 in [arms] restores that.
 bool mounted_parity=true;
-// Seventeenth step (2026-11-08, AUTHOR asked after the Cyberpunk VR port comparison): one rider solve per game tick, made once and replayed
+// Seventeenth step (2026-11-08): one rider solve per game tick, made once and replayed
 // to every draw of that tick (their animation-batch clock), the gun placement included. Off: the per-camera-step latch (steps 8-16).
 bool rider_tick_solve=true;
 std::atomic<unsigned> rider_tick_predicted{0},rider_tick_turned{0}; std::atomic<int> rider_tick_turn_cdeg{0};  // provisional samples moved by the camera offset's own velocity
@@ -439,7 +444,7 @@ std::atomic<unsigned> hand_swaps{0};
 // foregrip/pistol grip, and both weaponAttachmentHand bones are the gun socket frame (run 62), so
 // H_sup = raw[left wrist] * inverse(raw[attach]) is the per-weapon support hold, read live each solve. Left mode uses the
 // mirrored pair (mirror_hold). Grab = the support hand's grip near the support point (nearest point wins vs the handle
-// = hand swap). The gun swings about the dominant grip toward the support controller with Cyberpunk-port leverage rules;
+// = hand swap). The gun swings about the dominant grip toward the support controller;
 // a grab offset decays to 0 so a grab from a distance never snaps; one eased weight drives the gun and the hand slide.
 bool two_hand_enabled=true;
 bool mounted_weapon_menu=true;
@@ -450,6 +455,11 @@ long long support_hold_us=0;  // diagnostic freshness only; clean_mutex
 struct TwoHandState { int support=-1; bool held=false; long long start_us=0, release_us=0; float w_release=0.f; float offset_gun[3]{}; };
 TwoHandState two_hand;     // clean_mutex
 float th_d_support[2]={1e9f,1e9f},th_d_handle[2]={1e9f,1e9f},th_offset_gun[2][3]{}; long long th_measured_us=0;  // clean_mutex
+float th_wrist_world[2][3]{}; long long th_wrist_us[2]{}; float th_sup_world[2][3]{},th_wrist_mat[2][16]{};  // clean_mutex: on-foot support controller wrist, world (bow pull)
+// FEATURE-07: the string point drawn this frame at the hand's pull (world), for the off hand's pin (bow_vis_mutex).
+std::atomic<unsigned> bow_hand_pins{0},rack_hand_pins{0};
+bool bow_pin_now[2]{}; float bow_pin_gap_max=0.f; unsigned bow_pin_gap_nock=0;  // solve thread: wrist vs string pin (reach)
+std::mutex bow_vis_mutex; float bow_vis_string[3]{}; float bow_vis_axes[9]{}; ULONGLONG bow_vis_string_tick=0;  // axes: bow root rows
 std::atomic<unsigned> two_hand_grabs{0},two_hand_pins{0}; std::atomic<int> two_hand_w_milli{0},two_hand_lev_milli{0},two_hand_deg_milli{0};
 constexpr long long kTwoHandInUs=200000, kTwoHandOutUs=80000, kTwoHandOffsetUs=250000;
 // Run 68 "support-hand only": while two-handed, the trigger hand's grip press lets that hand go; the gun eases into the
@@ -524,8 +534,7 @@ ULONGLONG gun_source_since=0;  // [HEADSET run 25] offset differed after weapon 
 struct GunSlot { const void* src=nullptr; float offset[16]; bool valid=false; std::int16_t cell[3]{}; ULONGLONG since=0,seen=0; };
 GunSlot gun_slots[4];
 // [HEADSET run 37] turning with the stick: grip and gun separate and flicker. The hand read the gun root from the pose
-// buffer at solve time, which during fast turns can be another frame's pose than the one drawn. Like the Cyberpunk port
-// (arm solve and weapon bones in the same pose pass), the weapon hand now uses only the gun socket recorded at the gun's
+// buffer at solve time, which during fast turns can be another frame's pose than the one drawn. The weapon hand now uses only the gun socket recorded at the gun's
 // own draw in the SAME frame (frame_gen); otherwise the placed socket, never a possibly stale buffer read.
 float gun_actual_world[16]{}; unsigned gun_actual_gen=0;  // gun_mutex
 std::atomic<unsigned> gun_same_frame{0},gun_other_frame{0},fp_after_gun{0},fp_before_gun{0};
@@ -680,17 +689,14 @@ std::wstring dir;
 ULONGLONG last_poll=0;
 bool wanted_before=false,tried=false,installed=false;
 void log(const char* line) {
-  HANDLE f=CreateFileW((dir+L"\\SKIN_PALETTE_PROBE.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if(f==INVALID_HANDLE_VALUE) return;
-  DWORD n; WriteFile(f,line,static_cast<DWORD>(std::strlen(line)),&n,nullptr);
-  WriteFile(f,"\r\n",2,&n,nullptr); CloseHandle(f);
+  runtime_log::append(dir+L"\\SKIN_PALETTE_PROBE.log", {line, "\r\n"});
 }
 // Present owns file I/O. Palette/shot callbacks only publish immutable numeric
 // profiles under their mutex; no native pointers are persisted.
 void mounted_profile_io() {
   static bool loaded=false; static std::uint64_t saved=0; static ULONGLONG retry_at=0;
   if(dir.empty()) return;
-  const auto path=dir+L"\\AvatarVR_weapon_holds.txt";
+  const auto path=dir+L"\\AvatarVR\\state\\AvatarVR_weapon_holds.txt";
   if(!loaded) {
     loaded=true; std::string text; mounted_weapon_profiles::Cache restored;
     HANDLE file=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
@@ -931,9 +937,9 @@ bool rig_body_read(const void* body,float* out) {
 // one-generation hold on a lost alignment or a jump with a still controller) reaches the gun without a second path.
 // On foot (2026-11-13): eye = the drawn eye centre in the shoulder's space turns on the hybrid reach (1:1 near the body), and
 // arm_reach = upper + forearm length turns on the soft reach limit. Riding passes neither: the mount path is unchanged.
-bool guarded_hand_target(const float* sample16,const float* basis,const float* root,skin_arm_ik::Vec shoulder,float navi_length,unsigned hand,
+bool guarded_hand_target_held(const float* sample16,const float* basis,const float* root,skin_arm_ik::Vec shoulder,float navi_length,unsigned hand,
                          const vr_arms_math::HandLocal& local,float* wrist16,float* attach16,float* factor,bool* oriented,
-                         const skin_arm_ik::Vec* eye=nullptr,float arm_reach=0.f) {
+                         const skin_arm_ik::Vec* eye,float arm_reach) {
   bool ok=false; float weight=1.f;
   const bool hybrid=eye && hybrid_reach.enabled;
   if(!vr_arms_math::hand_target(sample16,basis,root,shoulder,navi_length,hand,arm_scale,skin_arm_ik::for_hand(hand_tune,hand),
@@ -990,12 +996,20 @@ bool guarded_hand_target(const float* sample16,const float* basis,const float* r
   }
   return true;
 }
+// Recoil (2026-11-17, vr_recoil): the kick goes on after the hold guard, so the hold keeps comparing un-kicked targets and a
+// kick with a still controller is never taken for a jump. One place: hands, the placed gun and its socket all get it.
+bool guarded_hand_target(const float* sample16,const float* basis,const float* root,skin_arm_ik::Vec shoulder,float navi_length,unsigned hand,
+                         const vr_arms_math::HandLocal& local,float* wrist16,float* attach16,float* factor,bool* oriented,
+                         const skin_arm_ik::Vec* eye=nullptr,float arm_reach=0.f) {
+  if(!guarded_hand_target_held(sample16,basis,root,shoulder,navi_length,hand,local,wrist16,attach16,factor,oriented,eye,arm_reach)) return false;
+  vr_recoil::apply(hand,root,wrist16,attach16);
+  return true;
+}
 bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211][16],const float* root_matrix,
               const std::int16_t* cell,const float* body_position,const GripCache& target,ULONGLONG now,bool sides) {
   std::memcpy(raw,snapshot,sizeof(raw));
     if(stable_rig) {
-      // Model-space hands: the rest pose is anchored to the FP root (body), not the camera bone (whose head-bob arcs the
-      // Cyberpunk port avoids for the shoulder pivot).
+      // Model-space hands anchor the rest pose to the body root to keep head bob out of the shoulder pivot.
       const bool on_root=model_space_hands||clean_rig;  // clean rig: shoulders always on the body root
       const int anchor_mode=clean_rig&&view_height_anchor?2:on_root?1:0;
       float cam[16],inv_cam[16]; std::memcpy(cam,on_root?root_matrix:snapshot[1],sizeof(cam));
@@ -1053,7 +1067,11 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
               float d=0.f; for(int k=0;k<3;++k) d+=(live[fb][12+k]-hf.smooth[fb][12+k])*(live[fb][12+k]-hf.smooth[fb][12+k]);
               worst=std::max(worst,d);}
             if(hf.have) {
-              if(frame_bones[3]>=0) hf.attach_cm=std::max(hf.attach_cm,skin_arm_ik::length(skin_arm_ik::sub(skin_arm_ik::position(live[frame_bones[3]]),skin_arm_ik::position(hf.smooth[frame_bones[3]])))*100.f);
+              if(frame_bones[3]>=0) {
+                const float residual_cm=skin_arm_ik::length(skin_arm_ik::sub(skin_arm_ik::position(live[frame_bones[3]]),skin_arm_ik::position(hf.smooth[frame_bones[3]])))*100.f;
+                hf.attach_cm=std::max(hf.attach_cm,residual_cm);
+                vr_recoil::note_anim(static_cast<int>(side),residual_cm);  // the game's fire animation, which the hold filter removes
+              }
               hf.knuckle_cm=std::max(hf.knuckle_cm,std::sqrt(worst)*100.f);}
             const unsigned gen_now=frame_gen.load(std::memory_order_relaxed);
             // [HEADSET 2026-10-31] on foot the armed hands are the steadiest: a held gun keeps the game's hand still against the wrist. Bare, the
@@ -1179,7 +1197,10 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
         bool fin=std::isfinite(sh.baseline); for(float v:sh.h_sup_l) fin=fin&&std::isfinite(v);
         sh.valid=fin && sh.baseline<1.2f;
         // Moving: the hold keeps its last value (native sway must not steer the two-hand swing), but stays "fresh".
-        std::lock_guard<std::mutex> lock(clean_mutex); if(sh.valid && (hand_layout_open || !support_hold.valid)) support_hold=sh; if(support_hold.valid) support_hold_us=clean_qpc_us();
+        // FEATURE-07: while a bow string is held the game's own timed draw moves this hold; keep the pre-draw one, so the
+        // drawing hand's rotation and support point stay put and only the 1:1 pull moves it.
+        const bool bow_freeze=bow_draw::pulling() && *bow_draw::visual_flag() && !bow_draw::native_drive();
+        std::lock_guard<std::mutex> lock(clean_mutex); if(sh.valid && !bow_freeze && (hand_layout_open || !support_hold.valid)) support_hold=sh; if(support_hold.valid) support_hold_us=clean_qpc_us();
         two_hand_lev_milli.store(static_cast<int>(sh.leverage*1000.f),std::memory_order_relaxed);
       }
     }
@@ -1292,7 +1313,7 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
               for(int k=0;k<3;++k) {dp+=(clean_wrist[12+k]+1024.f*cell[k]-jump_last_point[hand][k])*(clean_wrist[12+k]+1024.f*cell[k]-jump_last_point[hand][k]);
                 ds+=(t_clean.local[hand][12+k]-jump_last_sample[hand][k])*(t_clean.local[hand][12+k]-jump_last_sample[hand][k]);
                 db+=(bw[k]-jump_last_body[k])*(bw[k]-jump_last_body[k]);}
-              if(ds<0.002f*0.002f && db<0.002f*0.002f && dp>0.01f*0.01f) {
+              if(ds<0.002f*0.002f && db<0.002f*0.002f && dp>0.01f*0.01f && !vr_recoil::active(static_cast<int>(hand))) {
                 hand_jump_still.fetch_add(1,std::memory_order_relaxed);
                 static float last_root[16]{},last_basis[16]{},last_shoulder[3]{}; static unsigned long long last_seq=0; static unsigned last_gen=0;
                 if(jump_logs.fetch_add(1)<60) {
@@ -1505,9 +1526,57 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
             float pinned[16],own[16],mixed[16];
             skin_arm_ik::multiply_affine(pinned,h_sup,sock_w);
             std::memcpy(own,aligned,64); own[12]=point.x; own[13]=point.y; own[14]=point.z; own[15]=1.f;
+            // FEATURE-07 (HEADSET 2026-11-18 run after 847D70B2): with a bow string held, the pin follows the game's timed
+            // draw (h_sup comes from its pose), so the hand went fully back on its own. Pin the hand to the string drawn at
+            // the controller's pull instead, keeping the hand-to-string offset of the grab (the game has not drawn yet then).
+            bow_pin_now[hand]=false;
+            {const bow_draw::Visual bv=bow_draw::visual();
+              static unsigned bow_pin_nock=0; static float bow_pin_offset[3]{}; static bool bow_pin_have=false;
+              float sw[3],ax[9]; bool fresh=false;
+              {std::lock_guard<std::mutex> vlock(bow_vis_mutex); fresh=bow_vis_string_tick && GetTickCount64()-bow_vis_string_tick<=100;
+                std::memcpy(sw,bow_vis_string,12); std::memcpy(ax,bow_vis_axes,36);}
+              if(bv.holding && fresh) {
+                // HEADSET 2026-11-18 (DLL 1A094961): the offset was kept in world axes, so with the bow turning with the bow hand
+                // the hand slid off the string. It is kept in the bow root's axes now (rotates with the bow).
+                if(!bow_pin_have || bow_pin_nock!=bv.nock) {
+                  float ow[3]; for(int k=0;k<3;++k) ow[k]=pinned[12+k]+1024.f*cell[k]-sw[k];
+                  for(int r=0;r<3;++r) {const float* a=ax+r*3; const float l2=a[0]*a[0]+a[1]*a[1]+a[2]*a[2];
+                    bow_pin_offset[r]=l2>1e-8f?(ow[0]*a[0]+ow[1]*a[1]+ow[2]*a[2])/l2:0.f;}
+                  bow_pin_nock=bv.nock; bow_pin_have=true;
+                  char line[200]; std::snprintf(line,sizeof(line),"bow pull: off hand pinned to the drawn string (offset %.3f m)",
+                    std::sqrt(bow_pin_offset[0]*bow_pin_offset[0]+bow_pin_offset[1]*bow_pin_offset[1]+bow_pin_offset[2]*bow_pin_offset[2]));
+                  log(line);
+                }
+                for(int k=0;k<3;++k) pinned[12+k]=sw[k]+bow_pin_offset[0]*ax[k]+bow_pin_offset[1]*ax[3+k]+bow_pin_offset[2]*ax[6+k]-1024.f*cell[k];
+                bow_hand_pins.fetch_add(1,std::memory_order_relaxed);
+                bow_pin_now[hand]=w>=0.999f;
+              } else if(!bv.holding) {
+                if(bow_pin_have && bow_pin_gap_nock==bow_pin_nock) {
+                  char line[160]; std::snprintf(line,sizeof(line),"bow pull: drawn wrist was at most %.3f m from the string pin (arm reach)",bow_pin_gap_max);
+                  log(line);}
+                bow_pin_have=false; bow_pin_gap_max=0.f;
+              }
+            }
             vr_arms_math::blend_affine(own,pinned,w,mixed);
             bool fin=true; for(float v:mixed) fin=fin&&std::isfinite(v);
             if(fin) {std::memcpy(aligned,mixed,64); point={mixed[12],mixed[13],mixed[14]}; oriented=true; two_hand_pins.fetch_add(1,std::memory_order_relaxed);}
+          }
+        }
+      }
+      {  // FEATURE-05 rack (HEADSET 2026-11-19: the hand did not attach to the charging handle): the off hand's wrist target
+         // rides the handle, in the weapon socket's frame, eased in and out by manual_reload.
+        const manual_reload::Visual rv=manual_reload::visual();
+        float sock_c[16];
+        if(rv.pin_hand==static_cast<int>(hand) && rv.pin_weight>0.f && vr_weapon::weapon_placed_by_game()) {
+          bool have=vr_weapon::written_socket_in_cell(sock_c,cell);
+          if(!have && vr_weapon::written_socket(sock_c,nullptr)) {for(int k=0;k<3;++k) sock_c[12+k]-=1024.f*cell[k]; have=true;}
+          if(have) {
+            float pinned[16],own[16],mixed[16];
+            skin_arm_ik::multiply_affine(pinned,rv.pin_rel,sock_c);
+            std::memcpy(own,aligned,64); own[12]=point.x; own[13]=point.y; own[14]=point.z; own[15]=1.f;
+            vr_arms_math::blend_affine(own,pinned,std::fmin(1.f,rv.pin_weight),mixed);
+            bool fin=true; for(float v:mixed) fin=fin&&std::isfinite(v);
+            if(fin) {std::memcpy(aligned,mixed,64); point={mixed[12],mixed[13],mixed[14]}; oriented=true; rack_hand_pins.fetch_add(1,std::memory_order_relaxed);}
           }
         }
       }
@@ -1545,6 +1614,10 @@ bool solve_fp(float (&snapshot)[211][16],float (&raw)[211][16],float (&copy)[211
         pole_used=elbow_pole_out[hand];
       } else {std::lock_guard<std::mutex> lock(pole_mutex); elbow_pole[hand].primed=false; elbow_pole_have[hand]=false;}
       const bool applied=skin_arm_ik::apply(copy,snapshot,hand,point,pole_used);
+      if(applied && bow_pin_now[hand]) {  // FEATURE-07: how far the solved wrist is from the string pin (reach clamp)
+        const float g=skin_arm_ik::length(skin_arm_ik::sub(skin_arm_ik::position(copy[hand?115:16]),point));
+        bow_pin_gap_max=std::max(bow_pin_gap_max,g); bow_pin_gap_nock=bow_draw::visual().nock; bow_pin_now[hand]=false;
+      }
       if(applied) {
         const unsigned up=hand?113:14;
         const skin_arm_ik::Vec s0=skin_arm_ik::position(copy[up]),e0=skin_arm_ik::position(copy[up+1]),w0=skin_arm_ik::position(copy[up+2]);
@@ -2095,15 +2168,30 @@ void note_arrow(const void* mesh,const void* root,const void* cells,const float 
     char path[128]{};
     if(read_path(root,path) && std::strstr(path,"BOW")) {
       std::snprintf(entry.path,sizeof(entry.path),"%s",path);
+      std::string names;  // FEATURE-07: logged once per bow mesh (heavy/long bow bone names were never recorded)
+      int string_like=-1;
       for(unsigned i=0;i<n;++i) {Sample e{};
         if(!read_name(root,i,e)) continue;
+        if(names.size()<700) {names+=" "+std::to_string(i)+"="+e.bone_name;}
         if(!std::strcmp(e.bone_name,"C_arrow_01")) entry.arrow=static_cast<int>(i);
-        if(!std::strcmp(e.bone_name,"C_bowString")) entry.string=static_cast<int>(i);}
+        if(!std::strcmp(e.bone_name,"C_bowString")) entry.string=static_cast<int>(i);
+        if(string_like<0 && (std::strstr(e.bone_name,"String") || std::strstr(e.bone_name,"string")) && !std::strstr(e.bone_name,"accessory"))
+          string_like=static_cast<int>(i);}
+      if(entry.string<0) entry.string=string_like;
+      static std::vector<std::string> logged_bows;  // once per path (the index slots get reused, so "known" is not enough)
+      bool logged=false; {std::lock_guard<std::mutex> lock(arrow_mutex);
+        for(const auto& s:logged_bows) if(s==path) {logged=true; break;}
+        if(!logged && logged_bows.size()<64) logged_bows.emplace_back(path);}
+      if(!logged) {
+        char line[900]; std::snprintf(line,sizeof(line),"bow mesh bones: %s n=%u arrow=%d string=%d:%s",path,n,entry.arrow,entry.string,names.c_str());
+        log(line);
+      }
     }
     std::lock_guard<std::mutex> lock(arrow_mutex);
     arrow_index[reinterpret_cast<std::uintptr_t>(mesh)/64%16]=entry;
   }
-  if(entry.arrow<0) return;
+  if(entry.arrow<0 && entry.string<0) return;
+  if(entry.arrow<0) entry.arrow=0;  // a bow limb with a string but no arrow bone: its root stands in (direction from the arrow mesh)
   std::int16_t c[3]{}; if(!read(cells,0,c,sizeof(c))) return;
   const ULONGLONG now=GetTickCount64(); const std::uint64_t now_us=clean_qpc_us();
   // Distance of this draw's root from the tracked weapon socket and from the game's own (flat) socket, world.
@@ -2151,6 +2239,142 @@ void note_arrow(const void* mesh,const void* root,const void* cells,const float 
     arrow_stats.last_mesh=mesh; std::memcpy(arrow_stats.arrow_z,z,sizeof(z));
   }
 }
+// FEATURE-05 Stage 0 (read-only): the held rifle/shotgun's reload bones as drawn, for reload_probe. Names cached per mesh.
+struct ReloadMeshNames {const void* mesh=nullptr; unsigned n=0; bool weapon=false,rifle=false; int mag=-1,lever=-1; char path[128]{}; std::vector<std::string> names;};
+ReloadMeshNames reload_mesh_names[8]; unsigned reload_mesh_next=0; std::mutex reload_mesh_mutex;
+std::atomic<unsigned> reload_vis_calls{0},reload_vis_applied{0},reload_draws_hand{0},reload_draws_other{0};
+std::atomic<ULONGLONG> reload_vis_next{0};
+bool reload_mesh(const void* mesh,const void* root,unsigned n,ReloadMeshNames& entry) {
+  if(n<2 || n>16) return false;
+  bool known=false;
+  {std::lock_guard<std::mutex> lock(reload_mesh_mutex);
+    for(const auto& e:reload_mesh_names) if(e.mesh==mesh && e.n==n) {entry=e; known=true; break;}}
+  if(!known) {
+    entry=ReloadMeshNames{}; entry.mesh=mesh; entry.n=n;
+    if(read_path(root,entry.path) && (std::strstr(entry.path,"ASSAULT_RIFLE") || std::strstr(entry.path,"SHOTGUN"))) {
+      entry.weapon=true; entry.rifle=std::strstr(entry.path,"ASSAULT_RIFLE")!=nullptr; entry.names.resize(n);
+      for(unsigned i=0;i<n;++i) {Sample s{}; if(read_name(root,i,s)) entry.names[i]=s.bone_name;
+        if(entry.names[i]=="C_magazine") entry.mag=static_cast<int>(i);
+        if(entry.names[i]=="C_reloadLevel") entry.lever=static_cast<int>(i);}
+    }
+    std::lock_guard<std::mutex> lock(reload_mesh_mutex);
+    reload_mesh_names[reload_mesh_next++%8]=entry;
+  }
+  return entry.weapon;
+}
+void note_reload_draw(const void* mesh,const void* root,const void* cells,const float (*mats)[16],unsigned n,bool in_hand) {
+  // (in_hand is the caller's coarse test; the probe picks the draw nearest the tracked socket per frame)
+  if(!reload_probe::capture_on() || n<2 || n>16) return;
+  ReloadMeshNames entry;
+  if(!reload_mesh(mesh,root,n,entry)) return;
+  std::int16_t c[3]{}; if(!read(cells,0,c,sizeof(c))) return;
+  const char* names[16]{}; for(unsigned i=0;i<n;++i) names[i]=entry.names[i].empty()?nullptr:entry.names[i].c_str();
+  float socket_d=-1.f;
+  {float flat_s[16],ik_s[16];
+    if(in_hand && skin_palette_probe::weapon_attach_matrices(skin_palette_probe::weapon_hand_index(),flat_s,ik_s)) {
+      float s2=0.f; for(int k=0;k<3;++k) {const float e=mats[0][12+k]+1024.f*c[k]-ik_s[12+k]; s2+=e*e;} socket_d=std::sqrt(s2);}}
+  reload_probe::note_weapon_draw(entry.path,names,mats,n,c,socket_d);
+  if(entry.rifle) (in_hand?reload_draws_hand:reload_draws_other).fetch_add(1,std::memory_order_relaxed);
+}
+// FEATURE-05 Stage 1 (render-only, like bow_visual): while the hands own a rifle reload, C_magazine is drawn seated, in
+// the hand or hidden, and C_reloadLevel at rest plus the hand's rack pull, instead of the game's reload animation.
+// Replaces this draw's bone matrices only; no game memory is written. False = draw the game's own.
+bool reload_visual(const void* mesh,const void* root,unsigned n,float (*m)[16],const std::int16_t (&c)[3]) {
+  const manual_reload::Visual v=manual_reload::visual();
+  if(!v.active) return false;
+  ReloadMeshNames entry;
+  if(!reload_mesh(mesh,root,n,entry) || !entry.rifle) return false;
+  reload_vis_calls.fetch_add(1,std::memory_order_relaxed);
+  {const ULONGLONG now=GetTickCount64(); ULONGLONG next=reload_vis_next.load();
+    if(now>=next && reload_vis_next.compare_exchange_strong(next,now+2000) && next) {  // right-eye check: are all rifle draws overridden?
+      char line[240]; std::snprintf(line,sizeof(line),"reload draw: %u rifle draws offered to the override in 2 s, %u changed; draws seen in hand %u, elsewhere %u; rack hand pins %u",
+        reload_vis_calls.exchange(0),reload_vis_applied.exchange(0),reload_draws_hand.exchange(0),reload_draws_other.exchange(0),rack_hand_pins.exchange(0));
+      reload_probe::log_text(line);}}
+  reload_probe::WeaponFrame wf; if(!reload_probe::weapon_frame(wf)) return false;
+  bool changed=false;
+  if(entry.mag>0 && wf.have_mag && v.mag!=manual_reload::Visual::kGame) {
+    float r[16]; skin_arm_ik::multiply_affine(r,wf.mag_rest,m[0]);
+    if(v.mag==manual_reload::Visual::kHand) skin_arm_ik::multiply_affine(r,v.mag_rel,m[0]);  // relative to this draw's own root
+    if(v.mag==manual_reload::Visual::kHidden) for(int i=0;i<12;++i) r[i]*=1e-3f;
+    std::memcpy(m[entry.mag],r,64); changed=true;
+  }
+  if(entry.lever>0 && wf.have_lever && v.lever) {
+    float rel[16]; std::memcpy(rel,wf.lever_rest,64);
+    const float zs=std::sqrt(m[0][8]*m[0][8]+m[0][9]*m[0][9]+m[0][10]*m[0][10]);
+    rel[14]-=zs>1e-6f?v.lever_pull/zs:v.lever_pull;  // back along the gun's local Z (LIVE: the rack moves -Z 17 cm)
+    float r[16]; skin_arm_ik::multiply_affine(r,rel,m[0]);
+    std::memcpy(m[entry.lever],r,64); changed=true;
+  }
+  if(changed) reload_vis_applied.fetch_add(1,std::memory_order_relaxed);
+  return changed;
+}
+// FEATURE-07: while the string is held, the held bow's C_bowString is drawn at its rest point (bow root frame, learned while
+// not held) moved back by the off hand's own pull, 1:1; the arrow mesh moves by the same offset so it stays nocked.
+// Render-only: these matrices replace this draw call's bone pointer, no game memory is written. The limbs keep the game's
+// own bend (its timed draw), OPEN whether that reads as wrong at partial pulls.
+// Limbs (HEADSET 2026-11-18, DLL 82D2370C: "still a mix of native and manual"): each bow path keeps two poses of all its bones
+// in its root frame, rest (learned while no string is held) and the game's full draw (learned when bow_draw::native_full()).
+// While holding, every bone but the root and C_bowString is drawn between them at the string's travel toward the full-draw
+// string, so the limbs bend with the hand, not with the game's timer. Until a full pose is known the limbs keep the game's.
+constexpr unsigned kBowPoseBones=64;
+struct BowPose {char path[96]{}; unsigned n=0; float rest[kBowPoseBones][16]{}, full[kBowPoseBones][16]{}; bool have_rest=false,have_full=false;};
+BowPose bow_poses[6]; unsigned bow_pose_next=0;  // arrow_mutex
+BowPose* bow_pose_for(const char* path,unsigned n) {
+  for(auto& b:bow_poses) if(b.n==n && !std::strcmp(b.path,path)) return &b;
+  BowPose& b=bow_poses[bow_pose_next++%6]; b=BowPose{}; std::snprintf(b.path,sizeof(b.path),"%s",path); b.n=n; return &b;
+}
+float bow_vis_delta[3]{}; ULONGLONG bow_vis_tick=0;  // arrow_mutex
+bool bow_visual(const void* mesh,unsigned n,float (*m)[16],const std::int16_t (&c)[3]) {
+  ArrowIndex entry; bool known=false;
+  {std::lock_guard<std::mutex> lock(arrow_mutex);
+    for(const auto& a:arrow_index) if(a.mesh==mesh && a.n==n) {entry=a; known=true; break;}}
+  if(!known || !entry.path[0]) return false;
+  const bow_draw::Visual v=bow_draw::visual();
+  const ULONGLONG now=GetTickCount64();
+  if(v.holding && bow_draw::native_drive()) return false;  // the game draws the bow at the pull itself (charge write)
+  if(entry.string>=0 && entry.string<static_cast<int>(n) && n<=kBowPoseBones) {
+    float inv_root[16]; if(!skin_arm_ik::inverse_affine(inv_root,m[0])) return false;
+    std::lock_guard<std::mutex> lock(arrow_mutex);
+    BowPose& bp=*bow_pose_for(entry.path,n);
+    const int si=entry.string;
+    if(!v.holding) {
+      for(unsigned i=0;i<n;++i) skin_arm_ik::multiply_affine(bp.rest[i],m[i],inv_root);
+      bp.have_rest=true; return false;}
+    if(!bp.have_rest) return false;
+    if(bow_draw::native_full()) {  // the game's own full draw, this frame (source pose, before any redraw)
+      const bool first=!bp.have_full;
+      for(unsigned i=0;i<n;++i) skin_arm_ik::multiply_affine(bp.full[i],m[i],inv_root);
+      bp.have_full=true;
+      if(first) {char line[200]; std::snprintf(line,sizeof(line),"bow pull: full-draw pose learned for %s",entry.path); log(line);}
+    }
+    // String travel to the full draw, in the bow's frame: the limbs' blend fraction, and the 1:1 pull's limit.
+    float travel=0.f;
+    if(bp.have_full) {float t2=0.f; for(int k=0;k<3;++k) {const float d=bp.full[si][12+k]-bp.rest[si][12+k]; t2+=d*d;} travel=std::sqrt(t2);}
+    const float pull=travel>0.05f?std::min(v.pull,travel):v.pull;
+    const float f=travel>0.05f?std::clamp(pull/travel,0.f,1.f):0.f;
+    if(bp.have_full) {
+      for(unsigned i=1;i<n;++i) {
+        if(static_cast<int>(i)==si) continue;
+        float local[16]; for(int k=0;k<16;++k) local[k]=bp.rest[i][k]+(bp.full[i][k]-bp.rest[i][k])*f;
+        skin_arm_ik::multiply_affine(m[i],local,m[0]);
+      }
+    }
+    float s[16]; skin_arm_ik::multiply_affine(s,bp.rest[si],m[0]);
+    for(int k=0;k<3;++k) s[12+k]+=pull*v.dir[k];
+    for(int k=0;k<3;++k) bow_vis_delta[k]=s[12+k]-m[si][12+k];
+    bow_vis_tick=now; std::memcpy(m[si],s,64);
+    {std::lock_guard<std::mutex> vlock(bow_vis_mutex); for(int k=0;k<3;++k) bow_vis_string[k]=s[12+k]+1024.f*c[k];
+      for(int r=0;r<3;++r) for(int k=0;k<3;++k) bow_vis_axes[r*3+k]=m[0][r*4+k];
+      bow_vis_string_tick=now;}
+    return true;
+  }
+  if(entry.string<0 && entry.arrow>=0 && v.holding) {
+    float d[3]; {std::lock_guard<std::mutex> lock(arrow_mutex); if(!bow_vis_tick || now-bow_vis_tick>100) return false; std::memcpy(d,bow_vis_delta,12);}
+    for(unsigned i=0;i<n;++i) for(int k=0;k<3;++k) m[i][12+k]+=d[k];
+    return true;
+  }
+  return false;
+}
 bool weapon_call(void* mesh,const void* root,const void* bones,const void* remap,const void* cells,unsigned char* header,
                  const void* source,unsigned n,const game::Pointers& player,AccessoryMap& map,const float (&raw)[211][16],
                  const float (&out)[211][16],const float* out_root,const float* root_matrix) {
@@ -2165,13 +2389,22 @@ bool weapon_call(void* mesh,const void* root,const void* bones,const void* remap
   static thread_local float mats[kMaxGearBones][16];
   if(vr_weapon::weapon_placed_by_game() && !grip_redraw) {
     // the game placed it at the IK socket and it renders unchanged: the source pose is the drawn pose
+    static thread_local float bow_mats[kMaxGearBones][16]; bool bow_over=false;
     float root0[16],used_world[16],motion=1.f; std::int16_t c[3]{};
     if(n>=1 && read(source,0,root0,sizeof(root0)) && vr_weapon::written_socket(used_world,&motion) && read(cells,0,c,sizeof(c))) {
       float used[16]; std::memcpy(used,used_world,64); for(int k=0;k<3;++k) used[12+k]-=1024.f*c[k];
       {float precise[16]; if(vr_weapon::written_socket_in_cell(precise,c)) std::memcpy(used,precise,64);}
       const float gap=skin_arm_ik::length(skin_arm_ik::sub(skin_arm_ik::position(root0),skin_arm_ik::position(used)));
       // [LIVE 2026-11-07 probe] some captures sat ~5 m from the shot: a bow not in hand. Only the held one (same 0.8 m as below).
-      if(gap<0.8f && n>=2 && n<=8 && read(source,0,mats,static_cast<std::size_t>(n)*64)) note_arrow(mesh,root,cells,mats,n);
+      // FEATURE-07 [LIVE 2026-11-18 run 134327] the heavy bow limb (n=21) never reached note_arrow under n<=8: bow_draws=0.
+      if(gap<0.8f && n>=2 && n<=64 && read(source,0,mats,static_cast<std::size_t>(n)*64)) {
+        note_arrow(mesh,root,cells,mats,n);
+        note_reload_draw(mesh,root,cells,mats,n,gap<0.2f);
+        if(manual_reload::visual().active && n<=16) {
+          std::memcpy(bow_mats,mats,static_cast<std::size_t>(n)*64); bow_over=reload_visual(mesh,root,n,bow_mats,c);}
+        if(!bow_over && *bow_draw::visual_flag() && !mount_camera::rider_view()) {
+          std::memcpy(bow_mats,mats,static_cast<std::size_t>(n)*64); bow_over=bow_visual(mesh,n,bow_mats,c);}
+      }
       // Ownership/root agreement is still required; the native grip-space
       // collector itself rejects equip/reload motion over its 600 ms window.
       if(gap<.2f && !mount_camera::rider_view()) mounted_learn_support(root,raw,root0,used);
@@ -2342,6 +2575,12 @@ bool weapon_call(void* mesh,const void* root,const void* bones,const void* remap
         }
       }
     }
+    if(bow_over) {  // FEATURE-07 string/arrow at the hand's pull (render-only), same pointer check as the weapon redraw
+      const void* check=nullptr;
+      if(read(bones,0,&check,sizeof(check)) && check==source && game::pointers().body==player.body) {
+        const void* replacement=bow_mats; std::memcpy(header,&replacement,sizeof(replacement));
+        return original(mesh,root,header,remap,cells);}
+    }
     return original(mesh,root,bones,remap,cells);
   }
   if(vr_weapon::weapon_placed_by_game()) {
@@ -2448,6 +2687,8 @@ bool weapon_call(void* mesh,const void* root,const void* bones,const void* remap
   skin_arm_ik::multiply_affine(delta,inverse_raw,ik_attach);
   for(unsigned i=0;i<n;++i) {float r[16]; skin_arm_ik::multiply_affine(r,mats[i],delta); std::memcpy(mats[i],r,64);}
   note_arrow(mesh,root,cells,mats,n);  // as drawn after the hand change
+  note_reload_draw(mesh,root,cells,mats,n,dist[weapon_hand]<0.05f);
+  {std::int16_t rc[3]{}; if(manual_reload::visual().active && read(cells,0,rc,sizeof(rc))) reload_visual(mesh,root,n,mats,rc);}
   const void* check=nullptr;
   if(!read(bones,0,&check,sizeof(check)) || check!=source || game::pointers().body!=player.body) return original(mesh,root,bones,remap,cells);
   if(weapon_pose_write && *lua_host::writes_flag() && n<=8 && game::mem_write(const_cast<void*>(source),mats,static_cast<std::size_t>(n)*64)) {
@@ -3497,12 +3738,7 @@ void rider_tune_poll() {
   if(dir.empty() || now<rider_tune_next) return;
   rider_tune_next=now+250;
   std::string text;
-  FILE* f=nullptr;
-  if(_wfopen_s(&f,(dir+L"\\AvatarVR_ik_tune.txt").c_str(),L"rb")==0 && f) {
-    char buf[4096]; std::size_t n=0;
-    while((n=std::fread(buf,1,sizeof(buf),f))>0 && text.size()<65536) text.append(buf,n);
-    std::fclose(f);
-  }
+  settings_file::read(dir + L"\\AvatarVR_ik_tune.txt", text);
   const rider_ik::Tune parsed=rider_ik::parse_tune(text.c_str(),hand_tune);
   {std::lock_guard<std::mutex> lock(rider_tune_mutex); rider_tune=parsed;}
   if(text!=rider_tune_text) {
@@ -3912,7 +4148,7 @@ struct MountedGunProof {
 std::mutex mounted_gun_mutex;
 MountedGunProof mounted_gun_proof;
 // ---- Per-tick rider solve (rider_tick_solve) ----
-// [SOURCE cyberpunk-vr-port AnimPose.cpp] one arm solve per animation batch, replayed bit-identical to every pass of it. Here a game tick is
+// Each pass of a game tick uses the same arm solve. The tick is
 // identified by the body its meshes are posed at ([LIVE 10-26 MOUNT_CAMERA] every rider mesh root equals the body of its own step exactly).
 // The first request for a tick (gun placement in the game thread, or that tick's first draw) solves it with the newest controller sample,
 // carried to the tick's body; every later request for the same tick gets that solve unchanged. A standing mount gives every tick the same
@@ -3923,8 +4159,7 @@ MountedGunProof mounted_gun_proof;
 // with the body (camera minus body travel per step p99 10-11 cm, max 36-45 cm; the eye anchor follows C_head). A tick solved from an earlier
 // step's sample, carried by the body (bare 15 % of ticks; the gun hook almost always, carry about 19 cm), put the hands off the view by that
 // difference. Now a tick takes its own step's sample when published; a solve made before it (gun hook, early draw) is provisional and is
-// solved again once with the exact sample. The gun then follows the exact hand (eighteenth: follow_palm), as the Cyberpunk port's
-// weapon follows the hand.
+// solved again once with the exact sample. The gun follows the hand from that solve.
 struct RiderTickEntry {bool valid=false,unique=false,by_gun=false,provisional=false,drawn=false; float body[3]{}; std::uint64_t step=0; RiderSolve solve;};
 RiderTickEntry rider_tick_cache[6]; unsigned rider_tick_slot=0; int rider_tick_last=-1;  // rider_mutex
 bool rider_update_solve(const game::Pointers& player,const float* ahead_root=nullptr) {return rider_update_solve_core(player,ahead_root,nullptr);}
@@ -3961,7 +4196,7 @@ bool rider_tick_get(const game::Pointers& player,const float* key,bool by_gun,Ri
     if(!(e.unique || e.step==step)) continue;
     // Twentieth step [HEADSET 2026-11-08, 3E5A770E: bare much steadier; armed glitchy, left-arm accessory flickers]. [LIVE RIDER_TRACE_40007875]
     // 351 frames drew two solves: in 327 the switch fell inside the songcord's own draws (gun-made provisional, then refreshed), L spread up to
-    // 50 cm. As the Cyberpunk port's batch replay: once a draw has used a tick's solve it stays bit-identical for that tick; only a solve no
+    // 50 cm. Once a draw has used a tick's solve it stays bit-identical for that tick; only a solve no
     // draw has used yet (the gun hook's) is refreshed.
     if(e.provisional && exact && !by_gun && e.drawn) rider_tick_frozen.fetch_add(1,std::memory_order_relaxed);
     if(e.provisional && exact && !by_gun && !e.drawn) {  // the tick's own sample is out now: solve it once more, exactly
@@ -4217,10 +4452,9 @@ bool mounted_gun_palette(void* mesh,const void* root,const void* bones,const voi
   const void* private_source=mats; std::memcpy(header,&private_source,sizeof(private_source));
   return original(mesh,root,header,remap,cells);
 }
-// Harness frame census (2026-10-24 [LIVE]: the palms in the rider's pelvis frame spread 0.44-0.67 m with the hold
-// animation on, so the pelvis is not the harness frame). While riding, for every non-player mesh within 5 m: the game's
-// palms in that mesh's root frame and every bone's mean distance to each palm. The mount/harness mesh is the one in
-// which the held palms barely move; its nearest bone is the harness handle. Read-only; reported at the end of a ride.
+// During a requested mount capture, compare the native rider palms with the saddle
+// draw in its own cell. Near bones are leads for a visually verified grip anchor.
+// The census is read-only and reported when the ride ends.
 struct FrameCensus {
   std::string path; unsigned n=0; ULONGLONG next=0;
   rider_ik::GripStat palm[2];
@@ -4726,9 +4960,17 @@ bool rider_call(void* mesh,const void* root,const void* bones,const void* remap,
     rider_hidden.fetch_add(1,std::memory_order_relaxed);
     return original(mesh,root,header,remap,cells);
   }
-  if(!info.player && !info.hide && solved) {
-    const skin_arm_ik::Vec palms[2]={pose_at(rider_ik::kPalm[0]),pose_at(rider_ik::kPalm[1])};
-    rider_frame_sample(info.path,root,mats,n,root_matrix,palms);
+  if (!info.player && solved && mount_camera::capture_active() &&
+      info.path.find("/GEAR/MOUNT/BANSHEE/SADDLE_BRIDLE/") != std::string::npos) {
+    using namespace skin_arm_ik;
+    // The native rider pose and the saddle draw carry independent cell origins.
+    const Vec cell_delta{1024.f * (solve.cell[0] - cell[0]), 1024.f * (solve.cell[1] - cell[1]),
+                         1024.f * (solve.cell[2] - cell[2])};
+    const Vec palms[2]{add(pose_at(rider_ik::kPalm[0]), cell_delta),
+                       add(pose_at(rider_ik::kPalm[1]), cell_delta)};
+    const Vec saddle = position(root_matrix);
+    if (length(sub(palms[0], saddle)) < 4.f && length(sub(palms[1], saddle)) < 4.f)
+      rider_frame_sample(info.path,root,mats,n,root_matrix,palms);
   }
   if(rider_parity && correction && !info.arms && !info.hide && info.player && solve.rest_generation &&
      info.path.find("/GEAR/PLAYER/UTILITY/")!=std::string::npos) {
@@ -5381,7 +5623,10 @@ namespace {
 // second of any change. Script writes still resets at every launch (lua_host), so IK only acts after enabling it.
 struct Setting {const char* key; float* f; bool* b;};
 std::vector<Setting> settings() {
-  return {{"arm_ik",nullptr,&ik_menu},{"hand_pitch",&hand_tune.pitch,nullptr},{"hand_yaw",&hand_tune.yaw,nullptr},
+  return {{"arm_ik",nullptr,&ik_menu},{"recoil",nullptr,vr_recoil::enabled_flag()},{"recoil_strength",vr_recoil::strength_value(),nullptr},
+          {"recoil_haptic",nullptr,vr_recoil::haptic_flag()},{"recoil_signal",vr_recoil::signal_value(),nullptr},{"recoil_reference_cm",vr_recoil::reference_value(),nullptr},
+          {"bow_pull_string",nullptr,bow_draw::enabled_flag()},{"bow_tension_hold",nullptr,bow_draw::hold_mode_flag()},{"bow_press_fire",nullptr,bow_draw::press_fire_flag()},{"bow_draw_length",bow_draw::draw_length_value(),nullptr},{"bow_draw_probe",nullptr,bow_draw::probe_flag()},{"bow_string_visual",nullptr,bow_draw::visual_flag()},{"bow_charge_write",nullptr,bow_draw::charge_flag()},{"reload_probe",nullptr,reload_probe::probe_flag()},{"manual_reload",nullptr,manual_reload::enabled_flag()},{"reload_pace",nullptr,manual_reload::pace_flag()},{"reload_anim_pace",nullptr,manual_reload::anim_pace_flag()},
+          {"hand_pitch",&hand_tune.pitch,nullptr},{"hand_yaw",&hand_tune.yaw,nullptr},
           {"hand_roll",&hand_tune.roll,nullptr},{"hand_forward",&hand_tune.forward,nullptr},{"hand_up",&hand_tune.up,nullptr},
           {"hand_side",&hand_tune.side,nullptr},{"shoulder_height",&shoulder_height,nullptr},
           {"shoulder_forward",&shoulder_forward,nullptr},{"shoulders_follow",nullptr,&shoulders_follow},
@@ -5849,6 +6094,44 @@ RiderCounters rider_counters() {
           rider_anchored.load(), rider_mismatch_mm.load(), rider_mismatch_bone.load(), rider_self_solves.load(),
           rider_rest_solves.load(), rider_rest_captures.load()};
 }
+bool held_bow(float (&string)[16],float (&arrow)[16],float (&root)[16],char (&bow)[96]) {
+  std::lock_guard<std::mutex> lock(arrow_mutex);
+  if(!bow_tick || !bow_string_have || GetTickCount64()-bow_tick>200) return false;
+  std::memcpy(string,bow_string_world,64); std::memcpy(arrow,bow_arrow_world,64); std::memcpy(root,bow_limb_root_world,64);
+  std::memcpy(bow,bow_path,sizeof(bow)); return true;
+}
+// FEATURE-05: the support controller's wrist to the native two-hand support point (m), as measured for grab_two_hand;
+// 1e9 when not measured within 200 ms.
+float support_point_distance(int hand) {
+  if(hand<0 || hand>1) return 1e9f;
+  std::lock_guard<std::mutex> lock(clean_mutex);
+  if(!th_measured_us || clean_qpc_us()-th_measured_us>200000) return 1e9f;
+  return th_d_support[hand];
+}
+float handle_point_distance(int hand) {  // FEATURE-05: wrist to the trigger handle (hand-swap grab), 1e9 unknown
+  if(hand<0 || hand>1) return 1e9f;
+  std::lock_guard<std::mutex> lock(clean_mutex);
+  if(!th_measured_us || clean_qpc_us()-th_measured_us>200000) return 1e9f;
+  return th_d_handle[hand];
+}
+bool support_wrist_matrix(int hand,float (&m)[16]) {
+  if(hand<0 || hand>1) return false;
+  std::lock_guard<std::mutex> lock(clean_mutex);
+  if(!th_wrist_us[hand] || clean_qpc_us()-th_wrist_us[hand]>150000) return false;
+  std::memcpy(m,th_wrist_mat[hand],64); return true;
+}
+bool support_point_world(int hand,float (&p)[3]) {
+  if(hand<0 || hand>1) return false;
+  std::lock_guard<std::mutex> lock(clean_mutex);
+  if(!th_wrist_us[hand] || clean_qpc_us()-th_wrist_us[hand]>150000) return false;
+  std::memcpy(p,th_sup_world[hand],12); return true;
+}
+bool support_wrist_world(int hand,float (&p)[3]) {
+  if(hand<0 || hand>1) return false;
+  std::lock_guard<std::mutex> lock(clean_mutex);
+  if(!th_wrist_us[hand] || clean_qpc_us()-th_wrist_us[hand]>150000) return false;
+  std::memcpy(p,th_wrist_world[hand],12); return true;
+}
 bool drawn_arrow(float (&arrow)[16],float (&bow_root)[16],float (&string)[16],bool* have_string,char (&path)[96],char (*bow)[96]) {
   std::lock_guard<std::mutex> lock(arrow_mutex);
   const ULONGLONG now=GetTickCount64();
@@ -5996,9 +6279,16 @@ bool clean_place(int hand, float (&flat)[16], float (&ik)[16]) {
         float w=0.f,of=0.f; TwoHandState th;
         {std::lock_guard<std::mutex> lock(clean_mutex);
           th_d_support[sup]=std::sqrt(d_s); th_d_handle[sup]=std::sqrt(d_h); std::memcpy(th_offset_gun[sup],off_g,12); th_measured_us=us;
+          // FEATURE-07 bow pull (read-only). wrist_sup is cell-local under rig_coherent; the bow string is world
+          // (HEADSET run 150535: grips read 8506 m from the string), so add the cell origin back.
+          for(int k=0;k<3;++k) {th_wrist_world[sup][k]=wrist_sup[12+k]+origin[k]; th_sup_world[sup][k]=sup_pt[12+k]+origin[k];}
+          std::memcpy(th_wrist_mat[sup],wrist_sup,64); for(int k=0;k<3;++k) th_wrist_mat[sup][12+k]+=origin[k];
+          th_wrist_us[sup]=us;
           w=two_hand_weight_locked(us); th=two_hand;
           of=th.held?1.f-vr_arms_math::smoothstep(static_cast<float>(us-th.start_us)/kTwoHandOffsetUs):0.f;}
-        if(w>0.f && th.support==sup) {
+        // FEATURE-07 (HEADSET 2026-11-18): while a bow string is held the bow aims with the bow hand only; the swing toward
+        // the drawing hand turned the bow as it pulled. Guns keep the swing.
+        if(w>0.f && th.support==sup && !bow_draw::pulling()) {
           float o_w[3]; for(int k=0;k<3;++k) o_w[k]=(th.offset_gun[0]*socket[k]+th.offset_gun[1]*socket[4+k]+th.offset_gun[2]*socket[8+k])*of;
           const float pivot[3]={handle[12],handle[13],handle[14]};
           const float v_cur[3]={sup_pt[12]-pivot[0],sup_pt[13]-pivot[1],sup_pt[14]-pivot[2]};

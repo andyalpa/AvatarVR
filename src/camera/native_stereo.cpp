@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "native_stereo.hpp"
 #include "scan_uv_shader.hpp"
 #include "ui_canvas.hpp"
@@ -205,15 +206,13 @@ std::atomic<int> g_cullfov_mdeg{0};
 // symmetric union of the two. The rendered tangents travel with the pose snapshot to the projection layer.
 std::atomic<bool> g_auto_fov{false};
 std::atomic<bool> g_eye_shift{false};
-std::atomic<bool> g_zero_sep{false};  // "zerosep": test, both eye cameras at the centre point
 std::atomic<bool> g_zero_sep_forced{false};  // set by the foliage sweep for its duration
 std::atomic<int> g_auto_margin_pct{0};
 // Matched projection narrowed to a share of the headset FOV ("narrow N", percent, 100 = full): the same render pixels
 // cover fewer degrees (higher pixels per degree, sharper), the lens edges go black. "outeredge" (with per-eye
 // centering): each eye keeps its outer (temporal) edge and gives up its inner (nasal) side, which the other eye still
 // sees in the binocular overlap. Both cameras still look straight ahead -- the frustum is shifted, not turned -- so
-// view-dependent effects (reflections, shadows) stay consistent between the eyes. [AUTHOR] 2026-10-07 idea from a
-// Cyberpunk 2077 VR user who turned the cameras outward instead (toe-out) and lost reflection/shadow matching.
+// view-dependent effects (reflections, shadows) stay consistent between the eyes. Turning the cameras outward can make reflections and shadows disagree.
 std::atomic<int> g_narrow_pct{100};
 std::atomic<bool> g_outer_edge{false};
 // "vcrop P" (2026-11-11, ISSUE-05): keep P % of the headset's vertical FOV (tangents, top and bottom scaled alike, so
@@ -223,7 +222,7 @@ std::atomic<bool> g_outer_edge{false};
 std::atomic<int> g_vcrop_pct{100};
 // "symproj" (ISSUE-04 test, 2026-10-21): each eye renders an on-axis frustum (m8 = m9 = 0) that covers its own
 // off-centre window, and the XR layer is labelled with that wider frustum. Discriminates screen-space/lighting passes
-// that assume the image centre is the view direction (the Cyberpunk VR port needed shader twins for those) from
+// that assume the image centre is the view direction from
 // per-view state differences. Costs pixel density: the frustum grows to the larger tangent on each axis.
 std::atomic<bool> g_sym_proj{false};
 // UI distance ("uidepth M", metres; 0 = infinity). The game UI is drawn at the same pixels in both eyes, so its apparent
@@ -309,7 +308,7 @@ bool auto_projection(const head_pose::Snapshot& s, int eye, float aspect, AutoPr
     vu = std::max(vu, std::tan(f[2]));
     vd = std::max(vd, std::tan(-f[3]));
   }
-  const bool test_same = g_zero_sep.load(std::memory_order_relaxed) || g_zero_sep_forced.load(std::memory_order_relaxed);  // test: identical frustum in both eyes
+  const bool test_same = g_zero_sep_forced.load(std::memory_order_relaxed);  // test: identical frustum in both eyes
   const int narrow = g_narrow_pct.load(std::memory_order_relaxed);
   const float k = !test_same && narrow >= 40 && narrow < 100 ? static_cast<float>(narrow) * 0.01f : 1.f;
   vu *= k;
@@ -674,10 +673,12 @@ struct TraceEvent {
   std::uint32_t a, b;
 };
 constexpr int kTraceSize = 512;
+std::atomic<bool> g_diag_probes{false};
 TraceEvent g_trace[kTraceSize];
 std::atomic<std::uint32_t> g_trace_next{0};
 
 void trace(char type, int view, std::uint32_t a, std::uint32_t b) {
+  if (!g_diag_probes.load(std::memory_order_relaxed)) return;
   const std::uint32_t i = g_trace_next.fetch_add(1, std::memory_order_relaxed) % kTraceSize;
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
@@ -713,7 +714,7 @@ std::atomic<std::uint64_t> g_faults{0};
 
 std::wstring g_control_path;
 std::wstring g_log_path;
-std::wstring g_dump_path, g_dump_request;  // CODEDUMP.log and its request file
+std::wstring g_dump_path, g_dump_request;  // engine-code.txt and its request file
 
 void log_line(const char* fmt, ...) {
   char buffer[512];
@@ -729,15 +730,7 @@ void log_line(const char* fmt, ...) {
   GetLocalTime(&t);
   char stamp[24];
   snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u ", t.wHour, t.wMinute, t.wSecond);
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, stamp, static_cast<DWORD>(std::strlen(stamp)), &written, nullptr);
-  WriteFile(file, buffer, static_cast<DWORD>(std::strlen(buffer)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {stamp, buffer});
 }
 
 std::wstring self_dir() {
@@ -1600,26 +1593,7 @@ bool alloc_camera(unsigned char** slot, void* from) {
   }
 }
 
-// ---- "flatfollow" (ISSUE-04 test, 2026-10-21) -------------------------------------------------------------------------
-// The eye cameras are private copies built FROM the game camera (levelled, body yaw, then the HMD offset); the game
-// camera object itself stays the flat 16:9 camera facing the body. [AUTHOR] the VR image still behaves as if it were
-// centred on the flat screen (shapes and some shadows change with head turns and with the FOV). Engine systems that read
-// the game camera instead of a view's camera (light/shadow selection, LOD, streaming, cascade fit: owners UNKNOWN) would
-// do exactly that; the 10-06 "cullfov" test only widened that camera, it never turned it with the head. With
-// "flatfollow", after the eyes are built from the genuine game camera, the game camera itself becomes the mid-eye
-// camera with an on-axis FOV covering both eye frusta. Next head step: if the camera still holds our matrix (the
-// controller did not rebuild it), the genuine copy is assigned back first, so the head offset never compounds.
-// Side effect while on: gameplay code that reads the game camera (crosshair, scan targeting) follows the head.
-std::atomic<bool> g_flat_follow{false};
-alignas(16) unsigned char g_ff_backup[0x900];
-bool g_ff_written_valid = false;
-float g_ff_written[16] = {};
-float g_ff_last_m[9] = {}, g_ff_last_o[3] = {};
-bool g_ff_last_valid = false;
-std::atomic<std::uint64_t> g_ff_writes{0}, g_ff_restores{0}, g_ff_fail{0};
-std::atomic<int> g_ff_fov_mdeg{0};
-
-bool ff_read_matrix(void* cam, float* out16) {
+bool read_camera_matrix(void* cam, float* out16) {
   alignas(16) unsigned char desc[0x140];
   __try {
     std::memset(desc, 0, sizeof(desc));
@@ -1632,114 +1606,16 @@ bool ff_read_matrix(void* cam, float* out16) {
 }
 
 // Start of a head step: undo last step's write when the game did not rebuild its camera.
-void flat_follow_restore(void* game_cam) {
-  if (!g_ff_written_valid || game_cam == nullptr) {
-    return;
-  }
-  float cur[16];
-  if (ff_read_matrix(game_cam, cur) && std::memcmp(cur, g_ff_written, sizeof(cur)) == 0) {
-    __try {
-      reinterpret_cast<Fn2>(g_helpers[kHAssign].fn)(game_cam, g_ff_backup);
-      g_ff_restores.fetch_add(1, std::memory_order_relaxed);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      g_ff_fail.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-  g_ff_written_valid = false;
-}
-
-bool flat_follow_write_impl(void* game_cam, const float* m, const float* off, const float* pm, const float* poff, float fov) {
-  alignas(16) unsigned char tmp[0x900];
-  alignas(16) unsigned char desc[0x140];
-  alignas(16) unsigned char prev[0x140];
-  __try {
-    std::memset(g_ff_backup, 0, sizeof(g_ff_backup));
-    reinterpret_cast<Fn2>(g_helpers[kHCopyCtor].fn)(g_ff_backup, game_cam);
-    std::memset(tmp, 0, sizeof(tmp));
-    std::memset(desc, 0, sizeof(desc));
-    std::memset(prev, 0, sizeof(prev));
-    reinterpret_cast<Fn2>(g_helpers[kHCopyCtor].fn)(tmp, game_cam);
-    reinterpret_cast<Fn2>(g_helpers[kHDescCopy].fn)(desc, tmp);
-    reinterpret_cast<Fn2>(g_helpers[kHDescCopy].fn)(prev, tmp + 0x120);
-    if (g_level.load(std::memory_order_relaxed)) {  // same basis as the eyes (update_priv_camera_xf)
-      level_desc(desc, false);
-      level_desc(prev, false);
-    }
-    float body_yaw = 0.f;
-    if (read_body_yaw(&body_yaw)) {
-      apply_body_yaw(desc, body_yaw);
-      apply_body_yaw(prev, body_yaw);
-    }
-    transform_desc(desc, m, off);
-    transform_desc(prev, pm, poff);
-    const std::uint32_t dirty = 1;
-    std::memcpy(desc + 0x100, &fov, sizeof(float));
-    std::memcpy(prev + 0x100, &fov, sizeof(float));
-    std::memcpy(desc + 0xE0, &dirty, sizeof(dirty));
-    std::memcpy(prev + 0xE0, &dirty, sizeof(dirty));
-    const float o2[2] = {0.f, 0.f};
-    reinterpret_cast<Fn2>(g_helpers[kHProjOffset].fn)(desc, o2);
-    reinterpret_cast<Fn2>(g_helpers[kHProjOffset].fn)(prev, o2);
-    reinterpret_cast<Fn3>(g_helpers[kHBuild].fn)(tmp, desc, prev);
-    reinterpret_cast<Fn2>(g_helpers[kHAssign].fn)(game_cam, tmp);
-    return true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return false;
-  }
-}
-
-// End of a successful head step: the game camera becomes the mid-eye camera.
-void flat_follow_write(void* game_cam, const head_pose::Snapshot& snap) {
-  if (!g_flat_follow.load(std::memory_order_relaxed) || game_cam == nullptr || !snap.eye[0].rvalid || !snap.eye[1].rvalid) {
-    g_ff_last_valid = false;
-    return;
-  }
-  head_pose::Eye mid = snap.eye[0];
-  mid.px = 0.5f * (snap.eye[0].px + snap.eye[1].px);
-  mid.py = 0.5f * (snap.eye[0].py + snap.eye[1].py);
-  mid.pz = 0.5f * (snap.eye[0].pz + snap.eye[1].pz);
-  float m[9], off[3];
-  eye_transform(mid, m, off);
-  // On-axis frustum covering both eyes' rendered frusta at the game camera's own aspect.
-  float th = 0.f, tv = 0.f;
-  for (int e = 0; e < 2; ++e) {
-    const float* t = snap.eye[e].rtan;
-    th = std::max(th, std::max(-t[0], t[1]));
-    tv = std::max(tv, std::max(t[2], -t[3]));
-  }
-  float aspect = 0.f;
-  if (!read_aspect(game_cam, &aspect) || !(aspect > 0.3f && aspect < 4.f)) {
-    aspect = 16.f / 9.f;
-  }
-  const float fov = 2.f * std::atan(std::max(th, aspect * tv));
-  if (!(fov > 0.2f && fov < 3.05f)) {
-    return;
-  }
-  const float* pm = g_ff_last_valid ? g_ff_last_m : m;
-  const float* poff = g_ff_last_valid ? g_ff_last_o : off;
-  if (!flat_follow_write_impl(game_cam, m, off, pm, poff, fov)) {
-    g_ff_fail.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  std::memcpy(g_ff_last_m, m, sizeof(m));
-  std::memcpy(g_ff_last_o, off, sizeof(off));
-  g_ff_last_valid = true;
-  g_ff_written_valid = ff_read_matrix(game_cam, g_ff_written);
-  g_ff_writes.fetch_add(1, std::memory_order_relaxed);
-  g_ff_fov_mdeg.store(static_cast<int>(fov * 57295.78f), std::memory_order_relaxed);
-}
-
 // Game thread: head-tracked cameras for both eyes. Returns false when no pose is available (caller falls back).
 bool head_step(void* game_cam) {
   head_pose::Snapshot snap;
   if (!xr_runtime::latest_views(&snap)) {
     return false;
   }
-  flat_follow_restore(game_cam);  // eyes are always built from the genuine game camera
   {
     std::memcpy(g_mount_delta_prev, g_mount_delta, sizeof(g_mount_delta));
     float cam[16];
-    if (!ff_read_matrix(game_cam, cam) || !mount_camera::eye_anchor(cam + 12, g_mount_delta)) {
+    if (!read_camera_matrix(game_cam, cam) || !mount_camera::eye_anchor(cam + 12, g_mount_delta)) {
       std::memset(g_mount_delta, 0, sizeof(g_mount_delta));
     }
   }
@@ -1821,7 +1697,7 @@ bool head_step(void* game_cam) {
   for (int e = 0; e < 2; ++e) {
     float m[9], off[3];
     head_pose::Eye pose = snap.eye[e];
-    if (g_zero_sep.load(std::memory_order_relaxed) || g_zero_sep_forced.load(std::memory_order_relaxed)) {
+    if (g_zero_sep_forced.load(std::memory_order_relaxed)) {
       // Test: both eyes rendered from the point between them. Any left/right difference that remains is not parallax
       // (or camera-facing foliage turning to each eye) but something that differs in time between the two views.
       pose.px = 0.5f * (snap.eye[0].px + snap.eye[1].px);
@@ -1881,9 +1757,6 @@ bool head_step(void* game_cam) {
       }
     }
     g_ui_ipd = ipd > 0.04f && ipd < 0.09f ? ipd : 0.064f;
-  }
-  if (ok) {
-    flat_follow_write(game_cam, snap);
   }
   if (ok) {
     std::lock_guard<std::mutex> lock(g_applied_mutex);
@@ -1998,7 +1871,7 @@ bool g_reentry_armed = false;             // game thread
 int g_reentry_cursor = 0;                 // game thread: params-set frames with the virtual cursor on
 int g_reentry_plain = 0;                  // game thread: params-set frames without it
 ULONGLONG g_reentry_clear_since = 0;      // game thread
-std::atomic<bool> g_menu_return{true};
+std::atomic<bool> g_menu_return{false};  // opt-in "menureturn" since 2026-11-15 (false re-entry in gameplay)
 int g_front_menu_streak = 0;
 ULONGLONG g_front_clear_since = 0;
 
@@ -2135,11 +2008,11 @@ bool main_camera_pos(float* out3) {
   if (!read_ptr(static_cast<unsigned char*>(g_views[0].view) + kCameraOffset, &cam) || cam == nullptr) {
     return false;
   }
-  if (cam == g_priv_left && g_created_main_cam != nullptr) {
-    cam = g_created_main_cam;  // head mode: the game camera, not our left-eye camera
+  if ((cam == g_priv_left || (cam != nullptr && cam == g_priv_cam)) && g_created_main_cam != nullptr) {
+    cam = g_created_main_cam;  // head mode: the game camera, not our eye camera (AFW: either eye)
   }
   float m[16];
-  if (!ff_read_matrix(cam, m)) {
+  if (!read_camera_matrix(cam, m)) {
     return false;
   }
   for (int k = 0; k < 3; ++k) {
@@ -2276,8 +2149,8 @@ void log_scene_state(const char* when) {
   read_ptr(static_cast<unsigned char*>(main) + kWorldOffset, &cur[0]);
   read_ptr(static_cast<unsigned char*>(main) + kCameraOffset, &cur[1]);
   read_ptr(static_cast<unsigned char*>(main) + 0x18, &cur[2]);
-  if (cur[1] != nullptr && cur[1] == g_priv_left && g_created_main_cam != nullptr) {
-    cur[1] = g_created_main_cam;
+  if (cur[1] != nullptr && (cur[1] == g_priv_left || cur[1] == g_priv_cam) && g_created_main_cam != nullptr) {
+    cur[1] = g_created_main_cam;  // our eye cameras (AFW: the right one too) are not a game change
   }
   std::uint32_t active = 0;
   const int count = g_view_count.load();
@@ -2325,8 +2198,8 @@ void log_scene_state(const char* when) {
 void reset_for_rebuild() {
   if (g_created_main != nullptr && g_priv_left != nullptr) {
     void* cur = nullptr;
-    if (read_ptr(static_cast<unsigned char*>(g_created_main) + kCameraOffset, &cur) && cur == g_priv_left &&
-        g_created_main_cam != nullptr) {
+    if (read_ptr(static_cast<unsigned char*>(g_created_main) + kCameraOffset, &cur) &&
+        (cur == g_priv_left || (cur != nullptr && cur == g_priv_cam)) && g_created_main_cam != nullptr) {
       write_ptr(static_cast<unsigned char*>(g_created_main) + kCameraOffset, g_created_main_cam);  // game camera back first
     }
   }
@@ -2618,8 +2491,12 @@ std::uintptr_t StartFrame_hook(void* mgr, void* a2, void* a3, void* a4) {
       void* o = nullptr;
       const bool read_own = off == kCameraOffset ? (o = g_created_main_cam, true)
                                                  : read_ptr(static_cast<unsigned char*>(g_created) + off, &o);
-      if (read_ptr(static_cast<unsigned char*>(g_created_main) + off, &m) && off == kCameraOffset && m != nullptr && m == g_priv_left) {
-        m = g_created_main_cam;  // our head-tracked left camera, not a game change
+      // Our head-tracked eye cameras are not a game change: the left one, and (AFW, alternating eyes) the right one the
+      // main view borrows on right-eye frames. [HEADSET/AUTHOR + LIVE 2026-11-18 16:12, CF155171] Without the right
+      // camera here every right-eye frame looked like a camera swap: 646 retire/rebuild cycles in 24 s, both eyes broken.
+      if (read_ptr(static_cast<unsigned char*>(g_created_main) + off, &m) && off == kCameraOffset && m != nullptr &&
+          (m == g_priv_left || m == g_priv_cam)) {
+        m = g_created_main_cam;
       }
       if (m != nullptr && read_own && m != o) {
         changed = off == kWorldOffset ? "world" : off == kCameraOffset ? "camera" : "owner";
@@ -2731,7 +2608,8 @@ std::uintptr_t StartFrame_hook(void* mgr, void* a2, void* a3, void* a4) {
   }
   if (!head_done && g_created_main != nullptr && g_created_main_cam != nullptr && g_priv_left != nullptr) {
     void* cur = nullptr;
-    if (read_ptr(static_cast<unsigned char*>(g_created_main) + kCameraOffset, &cur) && cur == g_priv_left) {
+    if (read_ptr(static_cast<unsigned char*>(g_created_main) + kCameraOffset, &cur) &&
+        (cur == g_priv_left || (cur != nullptr && cur == g_priv_cam))) {
       write_ptr(static_cast<unsigned char*>(g_created_main) + kCameraOffset, g_created_main_cam);  // give the game camera back
     }
   }
@@ -3710,6 +3588,7 @@ std::atomic<int> g_ui_extra_mask{3};
 std::atomic<std::uint64_t> g_ui_extra_calls[2][3];  // [pass][eye]
 
 std::uintptr_t UiPass_hook(void* owner, void* view, void* a3, void* a4) {
+  // AFW: the main view draws whichever eye this frame shows, so its UI pass takes that eye's placement.
   const int eye = view == nullptr ? 0 : view == g_views[0].view ? 1 : view == g_created ? 2 : 0;
   const int outer = t_ui_eye;
   if (outer != 0) {
@@ -3828,7 +3707,9 @@ std::uintptr_t CamBuild_hook(void* view, void* a2, void* a3, void* a4) {
       g_head.load(std::memory_order_relaxed) && g_want_create.load(std::memory_order_relaxed) &&
       !g_rescued.load(std::memory_order_relaxed) && g_created_main_cam != nullptr && g_priv_left != nullptr) {
     void* cur = nullptr;
-    if (read_ptr(static_cast<unsigned char*>(view) + kCameraOffset, &cur) && cur == g_priv_left && head_step(g_created_main_cam)) {
+    if (read_ptr(static_cast<unsigned char*>(view) + kCameraOffset, &cur) &&
+        cur == g_priv_left &&
+        head_step(g_created_main_cam)) {
       g_head_prestepped = true;  // this frame's pose is in both private cameras before either view copies its camera
     }
   }
@@ -3846,6 +3727,9 @@ std::uintptr_t CamBuild_hook(void* view, void* a2, void* a3, void* a4) {
     if (read_u32(static_cast<unsigned char*>(view) + kFrameIdxGame, &slot) && slot < 8) {
       std::lock_guard<std::mutex> lock(g_applied_mutex);
       g_slot_pose[view == g_created ? 1 : 0][slot] = g_applied_count;  // index + 1 of the newest applied pose
+      if (view == g_created_main) {
+
+      }
     }
   }
   if (view != nullptr && view == g_created && g_created_main != nullptr && g_stereo_running.load(std::memory_order_relaxed)) {
@@ -4191,7 +4075,7 @@ void report_census() {
     last_wait_ticks[v] = wt;
     last_wait_calls[v] = wc;
   }
-  if (++reports % 6 != 0) {
+  if (++reports % 6 != 0 || !g_diag_probes.load(std::memory_order_relaxed)) {
     return;
   }
   {  // the last 40 pipeline events, oldest first; times in ms relative to the first
@@ -4435,155 +4319,12 @@ void log_pass_census() {
   }
 }
 
-// ---- per-view sun-shadow history slot ("shadowfix", ISSUE-04, 2026-10-21) -------------------------------------------
-// [STATIC] RenderShadows' helper 0x1401A1130(a1, view) stores the view's projected-CSM target (ShadowHistory from the
-// view's per-eye pool, or a transient ProjectedCsmQuarter) into ONE global slot, render-target global +0xE90 (ref-counted
-// pointer, refcount int at +8) with four descriptor qwords at +0xE98..+0xEB0. ComputeResolvedShadows' worker
-// 0x140186630(a1, view) reads that slot later (penumbra / screen-space sun shadow resolve). Both views share the slot, so
-// if the second view's writer runs between the main view's writer and reader, one eye resolves its sun shadows from the
-// other eye's history. The probe (always on, read-only) counts reads whose slot differs from what the same view wrote.
-// "shadowfix" swaps the view's own entry in for its read and restores it afterwards, holding its own reference so the
-// entry outlives the slot. Writer and swap/restore are serialized by g_shadow_lock (short sections only).
-constexpr std::uintptr_t kShadowWriteRva = 0x1A1130;
-constexpr unsigned char kShadowWriteSig[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x56};
-constexpr std::uintptr_t kShadowReadRva = 0x186630;
-constexpr unsigned char kShadowReadSig[] = {0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54};
-constexpr std::uintptr_t kRefReleaseRva = 0x3261190;  // release(obj): decrements +8, frees on the last reference
-constexpr unsigned char kRefReleaseSig[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x41, 0x08, 0x48, 0x8D, 0x51, 0x08};
-constexpr std::size_t kShadowSlot = 0xE90;
-using ShadowFn = void (*)(void*, void*);
-using RefReleaseFn = void (*)(void*);
-ShadowFn g_shadow_write = nullptr, g_shadow_read = nullptr;
-RefReleaseFn g_ref_release = nullptr;
-unsigned char* g_targets_global_ptr = nullptr;  // address of the global pointer (afop+0x96A1B80)
-std::atomic<bool> g_shadow_fix{false};
-// Performance pass 2026-10-22: the always-on research probes (shadow slot, light queue, shadow-pick recording) run only
-// with "diagprobes" in the native control (or their fix toggle); otherwise their hooks pass straight through.
-std::atomic<bool> g_diag_probes{false};
-SRWLOCK g_shadow_lock = SRWLOCK_INIT;
-struct ShadowView {
-  void* view = nullptr;
-  std::uint64_t entry[5] = {};  // slot pointer + descriptor, as this view's writer left it
-  void* held = nullptr;         // our reference on entry[0]
-  std::atomic<std::uint64_t> writes{0}, reads{0}, mismatched{0}, swapped{0}, overwritten{0}, unknown{0};
-};
-ShadowView g_shadow_views[2];  // 0 = main view (left eye), 1 = created view (right eye)
-std::atomic<std::uint64_t> g_shadow_other{0};
-
-bool ref_add(void* obj) {
-  __try {
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(static_cast<unsigned char*>(obj) + 8));
-    return true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return false;
-  }
-}
-void ref_release(void* obj) {
-  if (obj == nullptr || g_ref_release == nullptr) return;
-  __try {
-    g_ref_release(obj);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-  }
-}
 int shadow_view_index(void* view) {
   if (view == nullptr || !g_stereo_running.load(std::memory_order_relaxed)) return -1;
   if (view == g_created_main) return 0;
   if (view == g_created) return 1;
   return -1;
 }
-unsigned char* shadow_slot() {
-  void* global = nullptr;
-  if (g_targets_global_ptr == nullptr || !read_ptr(g_targets_global_ptr, &global) || global == nullptr) return nullptr;
-  return static_cast<unsigned char*>(global) + kShadowSlot;
-}
-
-void ShadowWrite_hook(void* a1, void* view) {
-  if (!g_diag_probes.load(std::memory_order_relaxed) && !g_shadow_fix.load(std::memory_order_relaxed)) {
-    g_shadow_write(a1, view);
-    return;
-  }
-  const int vi = shadow_view_index(view);
-  unsigned char* slot = vi >= 0 ? shadow_slot() : nullptr;
-  if (slot == nullptr) {
-    g_shadow_write(a1, view);
-    if (vi < 0) g_shadow_other.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  ShadowView& v = g_shadow_views[vi];
-  void* drop = nullptr;
-  AcquireSRWLockExclusive(&g_shadow_lock);
-  g_shadow_write(a1, view);
-  std::uint64_t e[5] = {};
-  if (read_bytes(slot, e, sizeof(e))) {
-    void* p = reinterpret_cast<void*>(e[0]);
-    if (p != v.held) {
-      drop = v.held;
-      v.held = p != nullptr && ref_add(p) ? p : nullptr;
-    }
-    std::memcpy(v.entry, e, sizeof(e));
-    v.view = view;
-  }
-  ReleaseSRWLockExclusive(&g_shadow_lock);
-  ref_release(drop);
-  v.writes.fetch_add(1, std::memory_order_relaxed);
-}
-
-void ShadowRead_hook(void* a1, void* view) {
-  if (!g_diag_probes.load(std::memory_order_relaxed) && !g_shadow_fix.load(std::memory_order_relaxed)) {
-    g_shadow_read(a1, view);
-    return;
-  }
-  const int vi = shadow_view_index(view);
-  unsigned char* slot = vi >= 0 ? shadow_slot() : nullptr;
-  if (slot == nullptr) {
-    g_shadow_read(a1, view);
-    return;
-  }
-  ShadowView& v = g_shadow_views[vi];
-  v.reads.fetch_add(1, std::memory_order_relaxed);
-  std::uint64_t old[5] = {}, mine[5] = {};
-  bool swapped = false;
-  AcquireSRWLockExclusive(&g_shadow_lock);
-  if (v.view != view || v.held == nullptr) {
-    v.unknown.fetch_add(1, std::memory_order_relaxed);
-  } else if (read_bytes(slot, old, sizeof(old)) && old[0] != v.entry[0]) {
-    v.mismatched.fetch_add(1, std::memory_order_relaxed);
-    std::memcpy(mine, v.entry, sizeof(mine));
-    if (g_shadow_fix.load(std::memory_order_relaxed) && ref_add(reinterpret_cast<void*>(mine[0]))) {
-      // the slot now owns the added reference on ours; we hold the slot's former reference on the old entry
-      swapped = write_bytes(slot, mine, sizeof(mine));
-      if (!swapped) ref_release(reinterpret_cast<void*>(mine[0]));
-    }
-  }
-  ReleaseSRWLockExclusive(&g_shadow_lock);
-  g_shadow_read(a1, view);
-  if (!swapped) return;
-  v.swapped.fetch_add(1, std::memory_order_relaxed);
-  void* drop = nullptr;
-  AcquireSRWLockExclusive(&g_shadow_lock);
-  std::uint64_t cur = 0;
-  if (read_bytes(slot, &cur, sizeof(cur)) && cur == mine[0] && write_bytes(slot, old, sizeof(old))) {
-    drop = reinterpret_cast<void*>(mine[0]);  // the slot owns the old entry again
-  } else {
-    drop = reinterpret_cast<void*>(old[0]);  // a writer replaced ours (and released it) meanwhile
-    v.overwritten.fetch_add(1, std::memory_order_relaxed);
-  }
-  ReleaseSRWLockExclusive(&g_shadow_lock);
-  ref_release(drop);
-}
-
-void log_shadow_slot() {
-  if (!g_diag_probes.load()) return;
-  for (int i = 0; i < 2; ++i) {
-    const ShadowView& v = g_shadow_views[i];
-    log_line("shadowslot %s: fix=%d writes=%llu reads=%llu mismatched=%llu swapped=%llu overwritten=%llu unknown=%llu other=%llu",
-             i == 0 ? "main" : "second", g_shadow_fix.load() ? 1 : 0, static_cast<unsigned long long>(v.writes.load()),
-             static_cast<unsigned long long>(v.reads.load()), static_cast<unsigned long long>(v.mismatched.load()),
-             static_cast<unsigned long long>(v.swapped.load()), static_cast<unsigned long long>(v.overwritten.load()),
-             static_cast<unsigned long long>(v.unknown.load()), static_cast<unsigned long long>(g_shadow_other.load()));
-  }
-}
-
 // ---- per-view light queue probe ("lightq", ISSUE-04, 2026-10-21; read-only) ------------------------------------------
 // [STATIC] 0x14022D950(owner, view) is the light job each view queues (registration 0x1402A7CA0, view job list +0x49F0).
 // It walks the owner's pending light list (owner+0x18 pointers, owner+0x20 count): every active light (light+0xE0 bit 0)
@@ -4711,111 +4452,13 @@ void log_light_queue() {
            static_cast<unsigned long long>(g_lightq_other.load()));
 }
 
-// ---- shared spot-shadow light choice ("shadowunion", ISSUE-04, 2026-10-21) --------------------------------------------
-// [STATIC] 0x1405B0F30(renderer = view+0x1C0) chooses each view's shadow-casting lights from the world list: score =
-// radius / (distance from renderer+0x8D0..0x8D8 + 11), halved when outside the 6 planes at [renderer+0x980] (16 bytes
-// each: nx ny nz d, inside >= 0), x1.2 when the light was already in this view's previous list (view+0x1088), then the
-// top N under a slot budget get shadow maps. [LIVE] lightq 12:36: the eyes' lists differ in ~96% of frames, ~4.5 lights
-// each only in one eye -- a shadow in one eye only. "shadowunion": for each eye's call the planes pointer is pointed at a
-// merged frustum (per plane the looser of the two eyes' planes, judged at a point 10 m ahead) and the position at the
-// mid-eye point, so both eyes score every light identically. The engine's plane memory is never written; the pointer and
-// position are restored right after the call. Measured by the lightq "shadow differ" counter.
-constexpr std::uintptr_t kShadowPickRva = 0x5B0F30;
-constexpr unsigned char kShadowPickSig[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x55, 0x41, 0x57, 0x48, 0x8D, 0xA8};
-using ShadowPickFn = void (*)(void*);
-ShadowPickFn g_shadow_pick = nullptr;
-std::atomic<bool> g_shadow_union{false};
-std::mutex g_pick_mutex;
-struct PickEye {
-  float planes[24] = {};
-  float pos[3] = {};
-  bool valid = false;
-};
-PickEye g_pick_eye[2];  // g_pick_mutex: latest planes and position each eye selected with
-thread_local float t_pick_planes[24];
-std::atomic<std::uint64_t> g_pick_calls[2], g_pick_merged{0}, g_pick_skipped{0};
-
-void ShadowPick_hook(void* renderer) {
-  if (!g_shadow_union.load(std::memory_order_relaxed)) {
-    g_shadow_pick(renderer);
-    return;
-  }
-  unsigned char* r = static_cast<unsigned char*>(renderer);
-  const int vi = renderer != nullptr ? shadow_view_index(r - 0x1C0) : -1;
-  if (vi < 0) {
-    g_shadow_pick(renderer);
-    return;
-  }
-  g_pick_calls[vi].fetch_add(1, std::memory_order_relaxed);
-  void* planes_ptr = nullptr;
-  float own[24], pos[3];
-  if (!read_ptr(r + 0x980, &planes_ptr) || planes_ptr == nullptr || !read_bytes(planes_ptr, own, sizeof(own)) ||
-      !read_bytes(r + 0x8D0, pos, sizeof(pos))) {
-    g_pick_skipped.fetch_add(1, std::memory_order_relaxed);
-    g_shadow_pick(renderer);
-    return;
-  }
-  PickEye other;
-  {
-    std::lock_guard<std::mutex> lock(g_pick_mutex);
-    std::memcpy(g_pick_eye[vi].planes, own, sizeof(own));
-    std::memcpy(g_pick_eye[vi].pos, pos, sizeof(pos));
-    g_pick_eye[vi].valid = true;
-    other = g_pick_eye[vi ^ 1];
-  }
-  if (!g_shadow_union.load(std::memory_order_relaxed) || !other.valid) {
-    g_shadow_pick(renderer);
-    return;
-  }
-  // mid-eye position; reference point 10 m along the inward normal sum of the near/far pair is unknown, so use the
-  // centroid direction of all six normals (they point inward), which lies inside both frusta
-  float mid[3], dir[3] = {0.f, 0.f, 0.f};
-  for (int k = 0; k < 3; ++k) mid[k] = 0.5f * (pos[k] + other.pos[k]);
-  for (int i = 0; i < 6; ++i) for (int k = 0; k < 3; ++k) dir[k] += own[i * 4 + k];
-  const float len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-  if (!(len > 1e-3f)) {
-    g_pick_skipped.fetch_add(1, std::memory_order_relaxed);
-    g_shadow_pick(renderer);
-    return;
-  }
-  float ref[3];
-  for (int k = 0; k < 3; ++k) ref[k] = mid[k] + dir[k] / len * 10.f;
-  float* merged = t_pick_planes;
-  for (int i = 0; i < 6; ++i) {
-    const float* a = own + i * 4;
-    const float* b = other.planes + i * 4;
-    const float da = a[0] * ref[0] + a[1] * ref[1] + a[2] * ref[2] + a[3];
-    const float db = b[0] * ref[0] + b[1] * ref[1] + b[2] * ref[2] + b[3];
-    std::memcpy(merged + i * 4, db > da ? b : a, 4 * sizeof(float));  // looser plane: the reference point is deeper inside
-  }
-  void* merged_ptr = merged;
-  if (!write_bytes(r + 0x980, &merged_ptr, sizeof(merged_ptr))) {
-    g_pick_skipped.fetch_add(1, std::memory_order_relaxed);
-    g_shadow_pick(renderer);
-    return;
-  }
-  write_bytes(r + 0x8D0, mid, sizeof(mid));
-  g_shadow_pick(renderer);
-  write_bytes(r + 0x980, &planes_ptr, sizeof(planes_ptr));
-  write_bytes(r + 0x8D0, pos, sizeof(pos));
-  g_pick_merged.fetch_add(1, std::memory_order_relaxed);
-}
-
-void log_shadow_pick() {
-  if (g_shadow_pick == nullptr) return;
-  log_line("shadowunion: %s calls main=%llu second=%llu merged=%llu skipped=%llu", g_shadow_union.load() ? "on" : "off",
-           static_cast<unsigned long long>(g_pick_calls[0].load()), static_cast<unsigned long long>(g_pick_calls[1].load()),
-           static_cast<unsigned long long>(g_pick_merged.load()), static_cast<unsigned long long>(g_pick_skipped.load()));
-}
-
 // ---- detail independent of the VR FOV ("lodfov", ISSUE-04, 2026-10-21) ------------------------------------------------
 // [STATIC] camera update 0x143073370(cam) writes cam+0x79C = (viewport width * 0.5) / tan(cam+0x220 * 0.5), the LOD focal
 // length in pixels (decomp 143000000.c:78757-78766; ortho cameras, cam+0x23C != 0, use another formula). Mesh LOD
 // (0x14036EC90, cull view setup 0x1402F9080), terrain/scatter quadtree LOD and texture-streaming mip requests
 // (0x143085AB0 callers) all multiply by it, so at a fixed eye width a wider VR FOV makes every detail decision act as if
 // objects were further away. [AUTHOR] lower VR FOV = better object/texture detail, wider = shapes change on head turns.
-// Same bug the Cyberpunk VR port fixed (src/Hooks/LodFov.cpp: LOD threshold clamped to the flat-screen value). "lodfov"
-// rewrites only +0x79C after each update of OUR eye cameras -- the private eye cameras and their per-frame sub-cameras
+// "lodfov" rewrites only +0x79C after each update of OUR eye cameras -- the private eye cameras and their per-frame sub-cameras
 // (view frame ring +0xEEF0 + j*0x8B0, the kSubCams) whose FOV equals the eye FOV -- to (width/2)/tan(ref/2), ref = the
 // game camera's own FOV or "lodref <deg>". The FOV fields, projection and culling planes are untouched.
 constexpr std::uintptr_t kCamUpdateRva = 0x3073370;
@@ -5718,6 +5361,33 @@ bool views_for_present(int lag, head_pose::Snapshot* out) {
   return true;
 }
 
+std::uint64_t render_pose_id(int which) {
+  void* view = which == 0 ? g_created_main : g_created;
+  std::uint32_t slot = 0xFFFFFFFF;
+  if (view == nullptr || !read_u32(static_cast<unsigned char*>(view) + kFrameIdxGame + 4, &slot) || slot >= 8) return 0;
+  std::lock_guard<std::mutex> lock(g_applied_mutex);
+  return g_slot_pose[which == 0 ? 0 : 1][slot];
+}
+
+std::uint64_t present_ids(std::uint64_t* right_out) {
+  *right_out = g_out_pose.load(std::memory_order_relaxed);
+  return render_pose_id(0);
+}
+
+bool present_snapshot_left(head_pose::Snapshot* out) {
+  std::uint32_t slot0 = 0xFFFFFFFF;
+  if (g_created_main != nullptr) {
+    read_u32(static_cast<unsigned char*>(g_created_main) + kFrameIdxGame + 4, &slot0);
+  }
+  std::lock_guard<std::mutex> lock(g_applied_mutex);
+  const std::uint64_t left = slot0 < 8 ? g_slot_pose[0][slot0] : 0;
+  if (!g_head.load() || left == 0 || g_applied_count < left || g_applied_count - left >= static_cast<std::uint64_t>(kPoseRing)) {
+    return false;
+  }
+  *out = g_applied[(left - 1) % kPoseRing];
+  return true;
+}
+
 bool presented_views(head_pose::Snapshot* out) {
   // Right eye: the pose of the frame the newest view-2 output belongs to. Left eye (backbuffer): the pose of the frame
   // view #0 rendered last, i.e. its +0x9EC8 slot at Present time. The two can be one frame apart; each eye is labelled
@@ -5855,9 +5525,8 @@ void install() {
   if (!dir.empty()) {
     g_control_path = dir + L"\\AvatarVR_native.txt";
     g_log_path = dir + L"\\NATIVE_STEREO.log";
-    g_dump_path = dir + L"\\CODEDUMP.log";
+    g_dump_path = dir + L"\\AvatarVR\\captures\\engine-code.txt";
     g_dump_request = dir + L"\\AvatarVR_dump.txt";
-    MoveFileExW(g_log_path.c_str(), (dir + L"\\NATIVE_STEREO.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   }
   log_line("native stereo probe build %s %s pid=%lu control=AvatarVR_native.txt (off|observe|mode N [view K] [kick]|second K SEP [world [src S]]|create [SEP] [offscreen])", __DATE__, __TIME__, GetCurrentProcessId());
   auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
@@ -5880,19 +5549,13 @@ void install() {
   // Particle visibility bit for the second view (fxbits, on by default; see ParticleCull_hook).
   hook_checked(base, kParticleCullRva, kParticleCullSig, sizeof(kParticleCullSig), reinterpret_cast<void*>(&ParticleCull_hook),
                reinterpret_cast<void**>(&g_particle_cull), "particle cull job (fxbits)");
-  {  // per-view sun-shadow slot probe / shadowfix: needs the engine's release function first
+  {  // Compatibility guard for this set of renderer hooks.
+    constexpr std::uintptr_t kRefReleaseRva = 0x3261190;
+    constexpr unsigned char kRefReleaseSig[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x41, 0x08, 0x48, 0x8D, 0x51, 0x08};
     unsigned char got[sizeof(kRefReleaseSig)] = {};
     if (read_bytes(base + kRefReleaseRva, got, sizeof(got)) && std::memcmp(got, kRefReleaseSig, sizeof(got)) == 0) {
-      g_ref_release = reinterpret_cast<RefReleaseFn>(base + kRefReleaseRva);
-      g_targets_global_ptr = base + kTargetsGlobalRva;
-      hook_checked(base, kShadowWriteRva, kShadowWriteSig, sizeof(kShadowWriteSig), reinterpret_cast<void*>(&ShadowWrite_hook),
-                   reinterpret_cast<void**>(&g_shadow_write), "shadow slot writer (shadowslot)");
-      hook_checked(base, kShadowReadRva, kShadowReadSig, sizeof(kShadowReadSig), reinterpret_cast<void*>(&ShadowRead_hook),
-                   reinterpret_cast<void**>(&g_shadow_read), "shadow slot reader (shadowslot)");
       hook_checked(base, kLightJobRva, kLightJobSig, sizeof(kLightJobSig), reinterpret_cast<void*>(&LightJob_hook),
                    reinterpret_cast<void**>(&g_light_job), "light queue job (lightq probe)");
-      hook_checked(base, kShadowPickRva, kShadowPickSig, sizeof(kShadowPickSig), reinterpret_cast<void*>(&ShadowPick_hook),
-                   reinterpret_cast<void**>(&g_shadow_pick), "spot-shadow light choice (shadowunion)");
       hook_checked(base, kCamUpdateRva, kCamUpdateSig, sizeof(kCamUpdateSig), reinterpret_cast<void*>(&CamUpdate_hook),
                    reinterpret_cast<void**>(&g_cam_update), "camera update, LOD focal (lodfov)");
       hook_checked(base, kLodScaleRva, kLodScaleSig, sizeof(kLodScaleSig), reinterpret_cast<void*>(&LodScale_hook),
@@ -6647,7 +6310,7 @@ void log_view_diff() {
   log_line("viewslot: %d slots set on the main view and empty on the second view (\"sharehooks\" copies them)", shares);
 }
 
-// Read-only code dump for static reading (CODEDUMP.log next to the DLL). Only the readable code section (see
+// Read-only code dump for static reading (engine-code.txt next to the DLL). Only the readable code section (see
 // text_section) is dumped; anything else (the protected regions) is refused. Requests come from scripts\AvatarVR_dump.txt
 // (lines "RVA LEN", hex), else a default list of the main-view-only job entries and the slot records found so far.
 
@@ -6678,7 +6341,7 @@ bool text_section(std::uint32_t rva, std::uint32_t len, char* name) {
 }
 
 // Background thread: for each word, ASCII strings in the readable data sections (never .sbss) that contain it, and the
-// code sites in Render's section that load their address with a RIP-relative LEA. Appended to CODEDUMP.log.
+// code sites in Render's section that load their address with a RIP-relative LEA. Appended to engine-code.txt.
 void find_xrefs(std::vector<std::string> words) {
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_module_base);
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_module_base + dos->e_lfanew);
@@ -6771,7 +6434,7 @@ void find_xrefs(std::vector<std::string> words) {
     put(line);
   }
   CloseHandle(out);
-  log_line("codedump: %zu strings for %zu words appended to CODEDUMP.log", hits.size(), words.size());
+  log_line("codedump: %zu strings for %zu words appended to engine-code.txt", hits.size(), words.size());
 }
 
 void dump_code() {
@@ -6780,6 +6443,7 @@ void dump_code() {
   if (done || g_module_base == nullptr || g_dump_path.empty()) {
     return;
   }
+  if (GetFileAttributesW(g_dump_request.c_str()) == INVALID_FILE_ATTRIBUTES) return;
   const ULONGLONG now = GetTickCount64();
   if (first == 0) {
     first = now;
@@ -6787,6 +6451,7 @@ void dump_code() {
   if (now - first < 10000) {
     return;  // after start-up, once the image is fully mapped
   }
+  CreateDirectoryW((self_dir() + L"\\AvatarVR\\captures").c_str(), nullptr);
   done = true;
   struct Req {
     std::uint32_t rva, len;
@@ -6883,7 +6548,7 @@ void dump_code() {
     ++dumped;
   }
   CloseHandle(out);
-  log_line("codedump: %d of %zu ranges written to CODEDUMP.log", dumped, reqs.size());
+  log_line("codedump: %d of %zu ranges written to engine-code.txt", dumped, reqs.size());
   if (words.empty()) {
     words = {"particle", "Particle", "fauna", "Fauna", "waterfall", "Waterfall", "VFX", "vfx", "critter", "Critter"};
   }
@@ -7094,7 +6759,10 @@ void poll() {
         g_scene_gate_on.store(std::strstr(text, "anyscene") == nullptr);
         g_load_settle.store(std::strstr(text, "nosettle") == nullptr);  // on by default (settle after loads)
         g_teleport_rebuild.store(std::strstr(text, "noteleport") == nullptr);  // on by default (fast travel rebuild, 2026-11-13)
-        g_menu_return.store(std::strstr(text, "nomenureturn") == nullptr);  // on by default (2026-11-13)
+        // OFF by default since 2026-11-15 (opt-in "menureturn"): LIVE runs 11-14 08:26 and 11-15 12:33 re-entered the
+        // front end in gameplay right after a load (virtual cursor on), which turned off hand gestures, the HUD/scanner
+        // stereo fixes and arm HUD placement for the whole session.
+        g_menu_return.store(std::strstr(text, "menureturn") != nullptr && std::strstr(text, "nomenureturn") == nullptr);
         {
           const bool menu_stereo = std::strstr(text, "nomenustereo") == nullptr;
           if (g_menu_stereo.exchange(menu_stereo) != menu_stereo) {
@@ -7147,10 +6815,7 @@ void poll() {
             g_vcrop_pct.store(v >= 60 && v <= 100 ? static_cast<int>(v) : 100);
           }
           g_sym_proj.store(std::strstr(text, "symproj") != nullptr);
-          g_shadow_fix.store(std::strstr(text, "shadowfix") != nullptr);
           g_diag_probes.store(std::strstr(text, "diagprobes") != nullptr);
-          g_flat_follow.store(std::strstr(text, "flatfollow") != nullptr);
-          g_shadow_union.store(std::strstr(text, "shadowunion") != nullptr);
           g_lod_fov.store(std::strstr(text, "lodfov") != nullptr);
           g_lod_tex_game.store(std::strstr(text, "lodtexgame") != nullptr);
           g_lod_probe.store(std::strstr(text, "lodprobe") != nullptr && std::strstr(text, "nolodprobe") == nullptr);
@@ -7173,7 +6838,6 @@ void poll() {
             const char* js = std::strstr(text, "jittersync");  // "nojittersync" (older files) also reads as off
             g_jitter_sync.store(js != nullptr && !(js - text >= 2 && js[-2] == 'n' && js[-1] == 'o'));
           }
-          g_zero_sep.store(std::strstr(text, "zerosep") != nullptr);
           {
             const char* ud = std::strstr(text, "uidepth");
             const double m = ud != nullptr ? std::strtod(ud + 7, nullptr) : 2.0;
@@ -7381,18 +7045,13 @@ void poll() {
     log_line("vegsync: %s, %d clock field(s) locked, %llu copies", g_vegsync.load() ? "on" : "off", g_clock_count.load(),
              static_cast<unsigned long long>(g_clock_copies.load()));
     log_jitter();
-    log_shadow_slot();
     log_light_queue();
-    log_shadow_pick();
     log_lod_fov();
     log_frame_status();
     log_lod_keep();
     log_lod_probe();
     log_qt_probe();
     log_spot_probe();
-    log_line("flatfollow: %s writes=%llu restores=%llu failed=%llu fov=%.1f deg", g_flat_follow.load() ? "on" : "off",
-             static_cast<unsigned long long>(g_ff_writes.load()), static_cast<unsigned long long>(g_ff_restores.load()),
-             static_cast<unsigned long long>(g_ff_fail.load()), g_ff_fov_mdeg.load() * 1e-3);
     log_wind_sync();
     log_fx_bits();
     log_line("level: %s, world up %c%c, applied %llu skipped %llu", g_level.load() ? "on" : "off",

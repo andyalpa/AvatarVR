@@ -4,7 +4,7 @@ Thanks for helping. The mod hooks a closed engine, so wrong guesses usually mean
 
 ## Getting started
 
-1. Build the mod and run the tests ([README.md, section 2](README.md#2-building-from-source-developers)).
+1. Build the mod and run the tests (see [Building from source](README.md#building-from-source)).
 2. Check [docs/ROADMAP.md](docs/ROADMAP.md) for open issues and features. Open an issue before starting anything large, so work isn't duplicated.
 
 ## Branches and pull requests

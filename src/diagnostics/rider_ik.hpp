@@ -660,10 +660,10 @@ struct Grab {
   bool was_pressed = false;
   float t = 1.f;  // linear: 1 = IK, 0 = game pose
   // Returns true on a grab (+1 edge) via `edge` = +1 grab, -1 release, 0 none.
-  void step(bool pressed, bool near, bool allowed, float dt, int& edge) {
+  void step(bool pressed, bool in_reach, bool allowed, float dt, int& edge) {
     edge = 0;
     if (!allowed) { if (held) edge = -1; held = false; }
-    else if (pressed && !was_pressed && near) { held = true; edge = 1; }
+    else if (pressed && !was_pressed && in_reach) { held = true; edge = 1; }
     else if (!pressed && held) { held = false; edge = -1; }
     was_pressed = pressed;
     const float d = std::clamp(std::isfinite(dt) ? dt : 0.f, 0.f, 0.1f) / kBlendSeconds;

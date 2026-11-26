@@ -1,165 +1,171 @@
-# AvatarVR
+<p align="center">
+  <img src="docs/media/banner.png" alt="Avatar: Frontiers of Pandora VR" width="900">
+</p>
 
-A native stereo VR mod for **Avatar: Frontiers of Pandora** on PC (Snowdrop engine).
+<p align="center">
+  A native stereo VR mod for <b>Avatar: Frontiers of Pandora</b> on PC.<br>
+  Tracked hands, real weapon handling, first-person riding, and a lot of rough edges.
+</p>
 
-- Both eyes rendered every frame (true stereo, not alternate-eye)
-- 6DoF head tracking with decoupled head pitch
-- OpenXR motion controllers, tracked arms, roomscale body follow
-- VR mod menu, HUD placed in 3D, comfort options
-
-This repository holds the mod's source code, tests and build scripts. It does **not** contain the game or any game files; you need your own copy. Current status: [docs/ROADMAP.md](docs/ROADMAP.md).
+<p align="center">
+  <a href="https://github.com/andyalpa/AvatarVR/releases/latest"><b>Download the latest test build</b></a> ·
+  <a href="#getting-started">Install</a> ·
+  <a href="docs/ROADMAP.md">Roadmap</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
 ---
 
-## 1. Installing the mod (players and testers)
+AvatarVR is a playable work in progress. I've been building it for a while and it's at the point where other people should be able to try it, break it, and hopefully help fix it. I'm sharing the build and the source so anyone who wants to fix a bug, finish a feature, or take the mod in their own direction can pick up where I left off.
+
+> [!WARNING]
+> This is a test build. Expect bugs, visual artifacts and a heavy performance cost. Back up your saves and your `scripts` folder before installing.
+
+## In the headset
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/media/hands.gif" width="420" alt="Tracked hands and finger gestures"><br><sub>Tracked hands and finger gestures</sub></td>
+    <td align="center"><img src="docs/media/weapon.gif" width="420" alt="Holding a weapon"><br><sub>The gun sits in your hand and follows the controller</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/media/two-hand-grip.gif" width="420" alt="Grabbing the gun with the free hand"><br><sub>Grab the front grip with your free hand</sub></td>
+    <td align="center"><img src="docs/media/two-hand-aim.gif" width="420" alt="Two-handed aiming"><br><sub>Two-handed aiming</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/media/arm-hud.gif" width="420" alt="HUD on the arm"><br><sub>Ammo and HUD widgets on your arm</sub></td>
+    <td align="center"><img src="docs/media/ikran.gif" width="420" alt="Ikran up close"><br><sub>Getting close to your ikran</sub></td>
+  </tr>
+</table>
+
+## What works
+
+- **VR view and hands**: Native stereo renders both eyes each game frame. The headset tracks your head, the character's hands follow your controllers, and supported touch and button inputs drive finger gestures.
+- **HUD and mounts**: You can attach supported HUD widgets to the character's arms or hands, or place them near your view. Mounting and riding can stay in first person. The flying controls and hand placement while riding still need work.
+- **Weapons**: Either hand can aim. The crosshair follows the weapon's aim ray, and you can grab a gun with your free hand to aim with both hands. Visual recoil moves the gun and arms. Automatic-fire recoil can be inconsistent.
+- **Bow and scanner**: On foot, grip the bowstring with your free hand, draw it back, and release to shoot. To use the X-ray scanner, bring your empty hand near your head and squeeze the grip.
+- **Frame generation**: The mod has its own frame generation under **Headset → Frame generation (mod)**. OFXR also works as an OpenXR layer. Use one or the other, not both.
+
+## Where it still needs work
+
+Everything above could use more polish. Watch for right-eye artifacts, uneven lighting between the eyes, and a dark right eye after fast travel. HUD elements and the crosshair can shift, and hand tracking can get shaky while riding.
+
+**Performance is the biggest limitation.** Native stereo is heavy, even on my RTX 4090. In my testing, getting a stable frame rate without frame generation was practically impossible. Frame generation makes head motion feel smoother, but busy scenes can still slow down.
+
+## Unfinished features and ideas
+
+- **Alternate Frame Warping (AFW)** was a prototype. I shelved it after headset tests showed wobble and shimmer.
+- **Manual reload** is an in-progress rifle prototype. Magazine placement, animation timing, and the charging handle still need work. The regular reload button still works.
+- **Visual holsters** for carrying gear on the body and over the shoulder. The shoulder gesture already works as a quick equip and stow shortcut.
+- **World interactions**: using your hands with animals and plants, a healing gesture, and throwing grenades by hand.
+- **A clearer VR menu, better flying controls**, and a proper harness grip for the ikran. There are more ideas in the [roadmap](docs/ROADMAP.md).
+
+## Getting started
 
 ### Requirements
 
-| | |
-|---|---|
-| Game | Avatar: Frontiers of Pandora, PC, Ubisoft Connect, version **1.0.2.2**. Other versions are not supported: the mod hooks addresses specific to this build. |
-| OS / GPU | Windows 10/11 x64, DirectX 12 GPU. Stereo doubles the rendering cost; development uses an RTX 4090. |
-| Headset | Any headset with an **OpenXR** runtime: SteamVR, Meta/Oculus, Virtual Desktop, … Tested on Quest 3 over Virtual Desktop. |
+- Avatar: Frontiers of Pandora **1.0.2.2**, Windows x64 PC version
+- A DirectX 12 GPU (a high-end one, see the performance notes above)
+- A PC VR headset with a working OpenXR runtime (SteamVR, Virtual Desktop, Oculus, etc.)
 
-### Steps
+### Install
 
-1. **Mod loader.** Download the Universal Snowdrop Modloader [`version.zip` (USM v1.0.0)](https://github.com/patrickmollohan/Universal-Snowdrop-Modloader-Old/releases/download/USM-v1.0.0/version.zip). Extract `version.dll` and `version.ini` into the game folder, next to `afop.exe`. Check that `version.ini` has `EnableScripts=true`.
-2. **Mod.** Create a `scripts` folder in the game folder if there isn't one, then put `AvatarVR.dll` in it:
-   ```
-   <game folder>\
-     afop.exe
-     version.dll
-     version.ini
-     scripts\AvatarVR.dll
-   ```
-   Get `AvatarVR.dll` from a release, or build it yourself (section 2).
-3. **Game settings** (see the table below): windowed display mode, DLSS on.
-4. Start your OpenXR runtime (SteamVR / Virtual Desktop / Meta link), then launch the game from Ubisoft Connect.
-5. Press **F10** for the mod menu, then **Mod → Load working preset**.
+1. Install the **Universal Snowdrop Modloader**. Put its `version.dll` and `version.ini` next to `afop.exe` and set `EnableScripts=true` in `version.ini`. [Loader download](https://github.com/patrickmollohan/Universal-Snowdrop-Modloader-Old/releases/download/USM-v1.0.0/version.zip)
+2. Download `AvatarVR-win-x64.zip` from [Releases](https://github.com/andyalpa/AvatarVR/releases/latest) and copy `scripts/AvatarVR.dll` into the game's `scripts/` folder.
+3. Start your OpenXR runtime and put the headset on before launching the game.
+4. Run the game in windowed mode with DLSS on. Press **F10** and pick **Mod → Load working preset**, then load into gameplay. Use **Stereo → Recenter view** if forward feels off. If motion feels choppy, lower **View → Eye resolution scale** one step at a time.
 
-### Keys
+To uninstall, delete `scripts/AvatarVR.dll`.
 
-| Key | Action |
-|---|---|
-| F10 | Open / close the mod menu (arrow keys, Enter, PgUp/PgDn to navigate; controllers work too) |
-| F9 | Save a screenshot of both eyes to `scripts\captures\` |
-| F7 | Reload Lua scripts (developers, see [docs/SCRIPTING.md](docs/SCRIPTING.md)) |
+### Controls and tuning
 
-### Files the mod writes
+- **Menu**: **F10** opens and closes the mod menu. Arrow keys and Enter select, Page Up and Page Down switch tabs. You can also point at it with your controllers. **F9** saves a stereo screenshot.
+- **Hands and weapons**: In **Scripts**, keep **Script writes** and **Arm IK (controllers)** on. Use **Calibrate arms (T-pose)** if your reach feels off. Turn on **Empty-hand gestures** for finger inputs and use **Tuner → Fingers** to adjust poses. Set **Weapon hand** to Left or Right, aim with that controller and fire with its trigger. With **Two-hand aiming** on, squeeze your free hand's grip at the gun's front grip to steady or steer it. **Recoil strength** sets how much kick you see.
+- **Bow and reload**: On foot, turn on **Bow string pull** and **Two-hand aiming**. Grip near the string with your free hand, draw back, and let go. While riding, use the regular trigger for the bow. With **VR controls** on, the upper face button on the gun hand reloads.
+- **Scanner and shoulders**: Turn on **VR controls**. Squeeze the grip with an empty hand near your head to scan. A grip tap over a shoulder equips or stows gear. Holding it opens the weapon wheel.
+- **HUD and riding**: Turn on **UI → Native HUD on arm**, then use **Tuner → HUD on arm** to pick an element and move it. Turn on **First-person mounts** under **Scripts** and use the normal mount and flight controls. **Arms follow controllers while mounted** keeps the tracked arms active while riding.
 
-All in `<game folder>\scripts\`:
+### If something goes wrong
 
-- `AvatarVR_settings.ini`: every mod setting. Delete it to reset to defaults.
-- `*.log`: diagnostic logs. Attach them to bug reports.
+- If the game stays flat, check that your OpenXR runtime sees the headset, then restart the game with the headset awake.
+- Your settings are saved in `scripts/AvatarVR_settings.ini`. Back it up if you want to try fresh settings.
+- When reporting a bug, please include what you were doing, your GPU, headset and OpenXR runtime, and `scripts/AvatarVR.log`. F9 screenshots are saved in `scripts/AvatarVR/captures/`.
 
-### Recommended game settings
-
-| Setting | Value | Why |
-|---|---|---|
-| Display mode | Windowed | The mod sizes the window to the headset's eye shape; render resolution follows the window. |
-| Upscaler | DLSS Quality or Balanced | Two views per frame; DLSS gives back frame rate. |
-| Object detail | Maximum | Each eye has a much wider view than a monitor, so lower settings make objects pop in and out. |
-| Vegetation, scatter density, streaming distance | As high as frame rate allows | Less pop-in. |
-| `stereo3d` in `graphic settings.cfg` | `0` | The mod renders the second eye itself. |
-| Dynamic resolution | Off, resolution scale 100 % | Otherwise it stays at its lowest scale in VR. |
-| Film grain, chromatic aberration, motion blur, depth of field | Off | They blur and smear in a headset. |
-
-Reference: RTX 4090, Quest 3 via Virtual Desktop at 72 Hz, 1992×2160 per eye: about 60 fps with DLSS, about 40 fps without.
-
-### Uninstall
-
-Delete `version.dll`, `version.ini` and `scripts\AvatarVR.dll` (and `scripts\AvatarVR_settings.ini` and `scripts\*.log` if you like). The game's own files are never modified.
-
-### Reporting a problem
-
-Open an issue with: what you were doing (on foot, weapon drawn, riding, menu, …), headset and OpenXR runtime, GPU, and the `scripts\*.log` files from that session.
-
----
-
-## 2. Building from source (developers)
+## Building from source
 
 ### Tools
 
-- **Visual Studio 2022** with the *Desktop development with C++* workload
-- **CMake 3.20+** (the copy bundled with Visual Studio is fine)
+- **Visual Studio 2026** with the *Desktop development with C++* workload
+- **CMake 4.2+** (the one that comes with Visual Studio is fine)
 - **Git**
-- Optional: **Python 3.11+** for the log tools and the arm tuner; **Lua 5.4** for the Lua tests
+- Optional: **Python 3.11+** for the log tools and the arm tuner, **Lua 5.4** for the Lua tests
 
-All other dependencies are in `third_party/`: MinHook, Dear ImGui, Lua 5.4 and the OpenXR SDK.
+Everything else is in `third_party/`: MinHook, Dear ImGui, Lua 5.4 and the OpenXR SDK.
 
 ### Build
 
 ```powershell
 git clone https://github.com/andyalpa/AvatarVR.git
 cd AvatarVR
-cmake -S . -B build
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-Output in `build\bin\`: `AvatarVR.dll` (the mod), `load_proof_host.exe` (loads the DLL outside the game as a smoke test) and the `*_test.exe` unit tests.
+The output goes to `build\bin\`: `AvatarVR.dll` (the mod), `load_proof_host.exe` (loads the DLL outside the game as a quick smoke test), and the `*_test.exe` unit tests.
 
 ### Build, install and launch in one step
 
-Point the scripts at your game folder once per terminal (or set it as a user environment variable):
+Point the scripts at your game folder once per terminal, or set it as a user environment variable:
 
 ```powershell
 $env:AFOP_GAME_ROOT = 'D:\Games\Avatar Frontiers of Pandora'
 tools\run_cycle.bat
 ```
 
-`run_cycle` builds the mod, runs the load test, copies `AvatarVR.dll` into `<game>\scripts\`, moves the previous logs into `<game>\scripts\runs\<time>\`, launches the game and waits for you to close it. Progress: `build\cycle_status.txt`. Full build log: `build\cycle_build.log`. It never touches `afop.exe`, `version.dll` or `version.ini`. The mod loader must already be installed (section 1, step 1).
+`run_cycle` builds the mod, runs the load test, copies `AvatarVR.dll` into `<game>\scripts\`, moves the previous logs into `<game>\scripts\runs\<time>\`, launches the game and waits for you to close it. Progress goes to `build\playtest\cycle_status.txt` and the full build log to `build\playtest\cycle_build.log`. It never touches `afop.exe`, `version.dll` or `version.ini`. The mod loader has to be installed already (see [Install](#install)).
 
 `tools\pull_and_cycle.bat` does a `git pull` first, then the same cycle.
 
-### Tests
+### Tests and releases
 
-| What | Command |
-|---|---|
-| All C++ unit tests | see the loop below |
-| DLL load smoke test | `build\bin\load_proof_host.exe` (exit code 0 = pass) |
-| Log analyzer tests | `python -I -m unittest discover -s tools/perf -p "test_*.py"` |
-| Lua math tests | `lua lua/tests/vrgameplay_test.lua` (and the other files in `lua/tests/`) |
+`ctest --test-dir build -C Release --output-on-failure` runs the standalone C++ tests and the DLL load check. `mv_repair_test.exe` and `scan_uv_shader_test.exe` need captured inputs; run them without arguments to see what they expect.
 
-```powershell
-Get-ChildItem build\bin\*_test.exe | Where-Object Name -ne 'mv_repair_test.exe' |
-  ForEach-Object { & $_.FullName > $null; '{0,-32} exit {1}' -f $_.Name, $LASTEXITCODE }
-```
-
-Every test should exit with 0. `mv_repair_test.exe` is an offline tool for captured frames, not a pass/fail test.
-
-Unit tests don't replace a headset test. Any change to rendering, camera, input or arms has to be checked in game. See [CONTRIBUTING.md](CONTRIBUTING.md#testing-in-the-headset).
+GitHub Actions runs the same build and tests on every push. Each successful run uploads a Windows x64 ZIP, and pushing a `v*` tag publishes that ZIP with its SHA-256 checksum to Releases. [docs/STATUS.md](docs/STATUS.md) lists the in-game checks that still need doing.
 
 ### Developer tools
 
 | Tool | Use |
 |---|---|
 | `python tools\perf\runs_report.py <game>\scripts\runs` | Frame rate and frame time per play session |
-| `python tools\perf\analyze_logs.py` | Summarize the renderer / CPU logs of a session |
-| `tools\ik_tuner\ik_tuner.bat` | Live arm-IK tuning window (writes `scripts\AvatarVR_ik_tune.txt`; the mod reloads it while running) |
-| Lua scripting, F7 to reload | Try gameplay ideas in the running game: [docs/SCRIPTING.md](docs/SCRIPTING.md) |
+| `python tools\perf\analyze_logs.py` | Summary of a session's renderer and CPU logs |
+| `tools\ik_tuner\ik_tuner.bat` | Live arm IK tuning window (writes the tuning sections of `AvatarVR_settings.ini` while the game runs) |
+| Lua scripting, F7 to reload | Try gameplay ideas in the running game. See [docs/SCRIPTING.md](docs/SCRIPTING.md). |
 
 ### Source layout
 
 | Path | Contents |
 |---|---|
-| `src/dllmain.cpp` | Entry point: starts hooks, menu, VR runtime |
+| `src/dllmain.cpp` | Entry point: starts the hooks, menu and VR runtime |
 | `src/camera/` | Second-eye rendering, per-eye camera and projection, UI placement, mounted camera |
 | `src/dx12/` | Direct3D 12 / DXGI hooks (Present, queues, swapchain) |
 | `src/vr/` | OpenXR session and frame submission, controller input, virtual gamepad, arms/IK, weapons, hand gestures |
 | `src/ui/` | Mod menu (ImGui) and HUD panels |
 | `src/game/` | Game-side hooks and state reads |
 | `src/sdk/` | Engine names and addresses for game version 1.0.2.2 |
-| `src/diagnostics/` | Probes and logs, all off unless enabled in the menu or settings |
+| `src/diagnostics/` | Capture tools and optional probes |
 | `src/script/` | Embedded Lua host |
 | `src/settings_file.hpp` | `AvatarVR_settings.ini` reader/writer |
-| `tools/tests/` | C++ unit tests (each is registered in `CMakeLists.txt`) |
+| `tools/tests/` | C++ unit tests (each one is registered in `CMakeLists.txt`) |
 | `tools/perf/` | Performance logging and analysis |
 | `tools/ik_tuner/` | Arm tuning app |
-| `lua/` | `lib/` shared Lua modules, `bench/` ready-made test scripts, `tests/` offline Lua tests |
+| `lua/` | Shared Lua modules and offline tests |
 | `third_party/` | Vendored libraries, each under its own license |
 
----
+## Contributing
+
+Pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first. The mod hooks a closed engine, so there are a few rules that keep things from crashing.
 
 ## Legal
 
-Unofficial fan project, not affiliated with or endorsed by Ubisoft, Massive Entertainment, Lightstorm or Disney. The mod doesn't modify game files and doesn't bypass DRM, anti-cheat or online services. Do not commit game files, game executables or extracted game data to this repository.
+This is an unofficial fan project. It isn't affiliated with or endorsed by Ubisoft, Massive Entertainment, Disney or Lightstorm. You need your own copy of the game. Don't commit game executables, assets or extracted game data to this repository.

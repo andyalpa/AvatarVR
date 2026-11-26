@@ -1,7 +1,11 @@
+#include "../runtime_log.hpp"
 #include "vr_controls.hpp"
 #include "vr_controls_math.hpp"
 #include "vr_arms.hpp"
 #include "vr_weapon.hpp"
+#include "bow_draw.hpp"
+#include "reload_probe.hpp"
+#include "manual_reload.hpp"
 #include "../diagnostics/skin_palette_probe.hpp"
 #include "../camera/mount_camera.hpp"
 #include <algorithm>
@@ -32,14 +36,14 @@ void log_line(const char* fmt, ...) {
   }
   char line[512];
   va_list args; va_start(args, fmt); std::vsnprintf(line, sizeof(line), fmt, args); va_end(args);
-  FILE* f = _wfopen(path.c_str(), L"a");
-  if (!f) return;
-  SYSTEMTIME t; GetLocalTime(&t);
-  std::fprintf(f, "%02u:%02u:%02u.%03u %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, line);
-  std::fclose(f);
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  char stamp[24];
+  std::snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u.%03u ", time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+  runtime_log::append(path, {stamp, line});
 }
 
-enum class Gesture { kNone, kShoulderPress, kWheel, kScan, kTwoHand, kOther };
+enum class Gesture { kNone, kShoulderPress, kWheel, kScan, kTwoHand, kBowString, kOther };
 struct HandState {
   bool grip = false, head = false, shoulder = false;
   Gesture gesture = Gesture::kNone;
@@ -47,7 +51,7 @@ struct HandState {
 };
 HandState g_hand[2];
 vr_controls_math::Flick g_flick;
-ULONGLONG g_tap_until_a = 0, g_tap_until_b = 0, g_tap_until_y = 0;
+ULONGLONG g_tap_until_a = 0, g_tap_until_b = 0, g_tap_until_y = 0, g_tap_until_x = 0;
 int g_wheel_hand = -1;
 std::atomic<bool> g_wheel{false};
 int g_pending_hand = -1;  // weapon hand to set once the equip/wheel completes
@@ -74,13 +78,14 @@ bool wheel_active() { return g_wheel.load(std::memory_order_relaxed); }
 bool hand_busy(int hand) {
   if(hand<0 || hand>1) return true;
   std::lock_guard<std::mutex> lock(g_mutex);
+  if(manual_reload::native_hand(hand)) return true;  // FEATURE-05: the game's own reload hold on the fingers
   return g_wheel.load(std::memory_order_relaxed) || g_hand[hand].gesture==Gesture::kScan ||
     g_hand[hand].gesture==Gesture::kShoulderPress;
 }
 
 bool compose(const xr_input::PadState& s, XINPUT_GAMEPAD* out, bool gameplay) {
-  if (!g_enabled) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_enabled) {bow_draw::reset(); manual_reload::reset(); return false;}
   const ULONGLONG now = GetTickCount64();
   // [HEADSET run 64] the scheme also replaced the default inputs in menus. Outside gameplay the plain mapping is used;
   // a wheel or scan that is still held keeps going until its grip is released (the wheel may pause the 3D view).
@@ -90,6 +95,8 @@ bool compose(const xr_input::PadState& s, XINPUT_GAMEPAD* out, bool gameplay) {
   if (!gameplay && !gesture_held) {
     for (auto& hs : g_hand) {hs.gesture = Gesture::kNone; hs.grip = (s.buttons & (&hs == &g_hand[0] ? XINPUT_GAMEPAD_LEFT_SHOULDER : XINPUT_GAMEPAD_RIGHT_SHOULDER)) != 0;}
     g_flick.armed = std::fabs(s.ry) < 0.30f;
+    bow_draw::reset();
+    manual_reload::reset();
     return false;
   }
   const int weapon_hand = skin_palette_probe::weapon_hand_index();  // 1 right, 0 left
@@ -99,6 +106,17 @@ bool compose(const xr_input::PadState& s, XINPUT_GAMEPAD* out, bool gameplay) {
   vr_arms::Sample smp;
   const bool have = vr_arms::latest(smp) && smp.head_valid;
   const bool grips[2] = {(s.buttons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0, (s.buttons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0};
+  // FEATURE-07: with a bow held, the other hand's grip at the string draws it and opening the grip shoots.
+  const bow_draw::Frame bow = bow_draw::update(weapon_hand, grips[1 - weapon_hand], g_haptics);
+  reload_probe::tick();  // FEATURE-05 Stage 0: read-only log of the game's own reload (VR_RELOAD.log)
+  // FEATURE-05 Stage 1: the off hand reloads the rifle (magazine out, new one from the hip, seat, rack after empty).
+  const WORD reload_button = weapon_hand == 0 ? XINPUT_GAMEPAD_Y : XINPUT_GAMEPAD_B;  // physical upper button of the weapon hand
+  float off_head[3]{};
+  const bool off_head_ok = have && smp.valid[1 - weapon_hand] &&
+                           vr_controls_math::head_frame(smp.head_rot, smp.local[1 - weapon_hand] + 12, off_head);
+  const manual_reload::Frame rl = manual_reload::update(weapon_hand, grips[1 - weapon_hand], (s.buttons & reload_button) != 0,
+                                                        off_head_ok, off_head, g_haptics);
+  if (rl.press_x) g_tap_until_x = now + vr_controls_math::kTapMs;
   // Run 65 hand-to-hand swap: the empty hand within 0.15 m of the weapon hand (grip to grip) + its grip press.
   float hands_apart = 1e9f;
   if (have && smp.valid[0] && smp.valid[1]) {
@@ -120,11 +138,32 @@ bool compose(const xr_input::PadState& s, XINPUT_GAMEPAD* out, bool gameplay) {
 
     // ---- grip gestures
     const bool grip = grips[h];
+    // FEATURE-05: the off hand's grip is the reload's (magazine, hip, charging handle): no other grip gesture.
+    if (rl.owns_grip && h == 1 - weapon_hand) {
+      if (grip && !hs.grip) {hs.since = now; hs.gesture = Gesture::kOther;}
+      hs.grip = grip; if (!grip) hs.gesture = Gesture::kNone;
+      continue;
+    }
+    // FEATURE-07: with a bow ready, the bow hand's grip is just holding the bow (support-only would hand it to the string hand).
+    if (grip && !hs.grip && weapon_held && h == weapon_hand && bow.ready) {hs.since = now; hs.gesture = Gesture::kOther; hs.grip = grip; continue;}
     if (grip && !hs.grip && weapon_held && h == weapon_hand) {  // run 68: the trigger hand's grip while two-handed
       const int r = skin_palette_probe::dominant_grip_press();
       if (r == 1) {log_line("hand %d lets go of the gun: support hand only, no fire", h); if (g_haptics) xr_input::pulse(h, 0.04f, 0.4f);}
       if (r == 2) {log_line("hand %d re-grabs the gun handle", h); if (g_haptics) {xr_input::pulse(0, 0.04f, 0.5f); xr_input::pulse(1, 0.04f, 0.5f);}}
       if (r) {hs.since = now; hs.gesture = Gesture::kOther; hs.grip = grip; continue;}
+    }
+    // FEATURE-07: with a bow ready, only the native two-hand hold at the arrow nocks (the same grab as two-hand aiming);
+    // a grip in the air does nothing, a grip at the handle still swaps hands below.
+    if (grip && !hs.grip && bow.ready && h == bow.off_hand && !skin_palette_probe::hand_swap_active()) {
+      const int grab = skin_palette_probe::grab_two_hand(h);
+      if (grab == 1) {
+        hs.since = now; hs.gesture = Gesture::kBowString; hs.grip = grip;
+        bow_draw::request_nock();
+        log_line("hand %d takes the bow string (two-hand hold at the arrow)", h);
+        continue;
+      }
+      // Not at the arrow: no nock; the press goes on as usual (handle = swap, shoulder, scan).
+      if (grab != 2) log_line("hand %d grip with a bow, away from the arrow: no nock", h);
     }
     if (grip && !hs.grip && mount_camera::harness_near(h)) {  // FEATURE-06: a press at the harness grabs it, nothing else
       hs.since = now; hs.gesture = Gesture::kOther; hs.grip = grip;
@@ -179,6 +218,9 @@ bool compose(const xr_input::PadState& s, XINPUT_GAMEPAD* out, bool gameplay) {
       } else if (hs.gesture == Gesture::kTwoHand) {
         skin_palette_probe::release_two_hand(h);
         log_line("hand %d two-hand release", h);
+      } else if (hs.gesture == Gesture::kBowString) {
+        skin_palette_probe::release_two_hand(h);
+        log_line("hand %d lets go of the bow string", h);
       }
       hs.gesture = Gesture::kNone;
     }
@@ -208,11 +250,16 @@ bool compose(const xr_input::PadState& s, XINPUT_GAMEPAD* out, bool gameplay) {
   if (now < g_tap_until_a) b |= XINPUT_GAMEPAD_A;
   if (now < g_tap_until_b) b |= XINPUT_GAMEPAD_B;
   if (now < g_tap_until_y) b |= XINPUT_GAMEPAD_Y;
+  if (now < g_tap_until_x) b |= XINPUT_GAMEPAD_X;  // FEATURE-05: the magazine came out by hand
   if (g_wheel.load()) b |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+  if (bow.cancel_button) b |= XINPUT_GAMEPAD_X;  // FEATURE-07: the game's Cancel Shot (string pushed back to the bow)
   if (g_hand[0].gesture == Gesture::kScan || g_hand[1].gesture == Gesture::kScan) b |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
   out->wButtons = b;
-  out->bRightTrigger = skin_palette_probe::fire_blocked() ? 0  // run 68: the trigger hand is off the gun
-                                                            : to_trigger(weapon_hand == 0 ? s.lt : s.rt);  // fire = the weapon hand's trigger
+  out->bRightTrigger = bow.owns_trigger ? to_trigger(bow.rt)  // FEATURE-07: the string pull, the bow hand's trigger ignored
+                     : skin_palette_probe::fire_blocked() ? 0  // run 68: the trigger hand is off the gun
+                     : rl.block_fire ? 0                        // FEATURE-05: the hands are mid-reload
+                                                          : to_trigger(weapon_hand == 0 ? s.lt : s.rt);  // fire = the weapon hand's trigger
+  bow_draw::note_sent(out->bRightTrigger);
   out->bLeftTrigger = 0;                                            // ADS removed (automatic later)
   if (g_wheel.load()) {  // wheel selection with the left stick, no walking while choosing
     out->sThumbRX = to_axis(s.lx); out->sThumbRY = to_axis(s.ly);

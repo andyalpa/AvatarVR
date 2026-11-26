@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "camera.hpp"
 #include "../diagnostics/render_activity.hpp"
 #include "../diagnostics/hitch_probe.hpp"
@@ -1228,14 +1229,7 @@ void log_line(const std::string& text) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {text, "\r\n"});
 }
 
 void logf(const char* fmt, ...) {
@@ -1246,14 +1240,6 @@ void logf(const char* fmt, ...) {
   va_end(args);
   buffer[sizeof(buffer) - 1] = '\0';
   log_line(buffer);
-}
-
-void rotate_log() {
-  if (g_log_path.empty() || GetFileAttributesW(g_log_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    return;
-  }
-  const std::wstring previous = parent_dir(g_log_path) + L"\\CAMERA_OBSERVE.prev.log";
-  MoveFileExW(g_log_path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 void* vtable_slot(void* object, int index) {
@@ -2192,7 +2178,9 @@ void prehud_note(ID3D12GraphicsCommandList* list) {
     return;
   }
   t_prehud_done = true;
-  if (ID3D12Resource* r = rtv_resource(t_rts[0].ptr)) frame_gen::capture_prehud(eye - 1, list, r);
+  if (ID3D12Resource* r = rtv_resource(t_rts[0].ptr)) {
+    frame_gen::capture_prehud(eye - 1, list, r);
+  }
 }
 
 void STDMETHODCALLTYPE Draw_hook(ID3D12GraphicsCommandList* list, UINT a, UINT b, UINT c, UINT d) {
@@ -3917,7 +3905,6 @@ void install() {
     return;
   }
   g_log_path = parent_dir(module_path(self)) + L"\\CAMERA_OBSERVE.log";
-  rotate_log();
   logf("camera observer build %s %s", __DATE__, __TIME__);
   // Dedicated startup flag: menu saves cannot silently remove the probe token.
   const std::wstring trace_path = parent_dir(g_log_path) + L"\\AvatarVR_scantrace.txt";

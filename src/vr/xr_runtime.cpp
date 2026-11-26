@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "xr_runtime.hpp"
 
 #include "../camera/camera.hpp"
@@ -269,15 +270,7 @@ void log_line(const char* fmt, ...) {
   char stamp[32];
   snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u.%03u ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
   std::lock_guard<std::mutex> lock(g_log_mutex);
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, stamp, static_cast<DWORD>(std::strlen(stamp)), &written, nullptr);
-  WriteFile(file, buffer, static_cast<DWORD>(std::strlen(buffer)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {stamp, buffer, "\r\n"});
 }
 
 std::wstring self_dir() {
@@ -598,11 +591,8 @@ double vismask_share(int e, const float* t) {
 }
 
 
-// ---- frame-generation layer status (2026-11-12) ---------------------------------------------------------------------
-// OFXR-Bridge and VectorXR are OpenXR API layers the loader puts between this mod and the runtime; neither appears in
-// the mod's own settings. The mod menu shows which one is loaded in this process and, when the tool exports its
-// status.json (OFXR: tray Logging -> "Export status.json"; VectorXR: always), whether it generates frames and the
-// game / headset frame rates. Read-only; never changes either tool.
+// ---- frame generation status -------------------------------------------------------------------------------------
+// Reports this mod's own rendered and generated frames per second.
 char g_framegen_status[192] = "Frame generation (mod): off";
 ULONGLONG g_framegen_checked = 0;
 
@@ -1147,7 +1137,7 @@ void hud_capture_collect() {
   D3D12_RANGE unchanged = {0, 0};
   g_hud_readback->Unmap(0, &unchanged);
   g_hud_readback->Release(); g_hud_readback = nullptr;
-  const std::wstring dir = self_dir() + L"\\captures";
+  const std::wstring dir = self_dir() + L"\\AvatarVR\\captures";
   CreateDirectoryW(dir.c_str(), nullptr);
   auto save = [&](const wchar_t* name, const std::vector<unsigned char>& pixels) {
     HANDLE file = CreateFileW((dir + name).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
@@ -1935,7 +1925,7 @@ void transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RE
 // With "eyesize W H both" both views render offscreen at the eye size and nothing draws the backbuffer. The left
 // eye is copied into our own texture (state-managed) and drawn over the whole backbuffer with a fullscreen triangle,
 // cropped to the window's aspect (fill, centred) and with no blending, so a widescreen window shows the middle of the
-// eye image (UEVR's spectator view). One small draw per Present; the game renders nothing extra.
+// submitted eye image. The monitor copy takes one draw per Present.
 ID3D12RootSignature* g_mir_rs = nullptr;
 ID3D12PipelineState* g_mir_pso = nullptr;
 ID3D12PipelineState* g_mir_pso_blend = nullptr;  // main menu panel over the mirror (premultiplied alpha)
@@ -2907,7 +2897,7 @@ void burst_poll(const std::wstring& dir) {
   if (g_burst_want == 0 || g_burst_next < g_burst_want || GetTickCount64() - g_burst_done_at < 1000) {
     return;
   }
-  const std::wstring folder = dir + L"\\captures";
+  const std::wstring folder = dir + L"\\AvatarVR\\captures";
   CreateDirectoryW(folder.c_str(), nullptr);
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
@@ -3184,7 +3174,7 @@ void copy_present(IDXGISwapChain* swapchain) {
     // and the backbuffer are the same engine frame (the game renders and presents each frame before starting the next;
     // trace 2026-10-05 13:01), so no hold is needed and both eyes are labelled with that pose.
     head_pose::Snapshot ident;
-    const bool identity = right != nullptr && native_stereo::presented_views(&ident);
+    bool identity = right != nullptr && native_stereo::presented_views(&ident);
     if (identity) {
       g_hold_valid = false;
     } else if (!eye_mode && right != nullptr && g_pair.load() && ensure_holds(device, desc, right->GetDesc().Format)) {
@@ -3202,7 +3192,7 @@ void copy_present(IDXGISwapChain* swapchain) {
     right_loc.pResource = paired ? g_holds[g_hold_read] : right;
     right_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     right_loc.SubresourceIndex = 0;
-    const int right_eye = g_swap_eyes.load() ? 0 : 1;  // which XR eye gets the second view
+    int right_eye = g_swap_eyes.load() ? 0 : 1;  // which XR eye gets the second view (AFW: the made eye)
     D3D12_TEXTURE_COPY_LOCATION left_loc = {};
     left_loc.pResource = back;
     left_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -4505,10 +4495,20 @@ bool recommended_size(uint32_t* w, uint32_t* h) {
   return *w > 0 && *h > 0;
 }
 
+// AFW full-rate pacing (2026-11-15). [LIVE 16:12-16:31, pace=free] With AFW the game ran 90-98 fps against the 72 Hz
+// headset: about one frame in four was never shown and the rest reached the compositor at uneven times (AUTHOR: "both
+// eyes feel reprojected even though it shows high FPS"; the right eye, whose images alternate sources, wobbles most).
+// While AFW is on, each Present is released on a headset frame boundary at most once per refresh (game <= 72 fps, in
+// step with the display). "halfrate" keeps priority.
+// [HEADSET/AUTHOR + LIVE 16:34-16:36] Removed again: no visible change, and at 90 Hz it waited 9.3 ms per frame and held
+// the game at 72 fps (a frame ready just after a refresh waits almost a whole period). Kept as a stub for the A/B record.
+bool pace_full_rate() { return false; }
+
 void pace_present() {
   static LONGLONG last_release = 0;
-  if (!g_half_rate.load(std::memory_order_relaxed) || !g_session_running.load(std::memory_order_relaxed) ||
-      !native_stereo::stereo_running()) {
+  const bool half = g_half_rate.load(std::memory_order_relaxed);
+  const bool full = !half && pace_full_rate();
+  if (!(half || full) || !g_session_running.load(std::memory_order_relaxed) || !native_stereo::stereo_running()) {
     last_release = 0;
     return;
   }
@@ -4519,8 +4519,9 @@ void pace_present() {
   if (base == 0 || period <= 0 || now.QuadPart - base > 8 * period) {
     return;  // no live headset clock
   }
-  // Release on the first headset frame boundary at least two frames (less a quarter, for jitter) after the last one.
-  LONGLONG earliest = last_release == 0 ? now.QuadPart : last_release + 2 * period - period / 4;
+  // Release on the first headset frame boundary at least two frames (half rate) or one frame (AFW full rate), less a
+  // quarter for jitter, after the last one.
+  LONGLONG earliest = last_release == 0 ? now.QuadPart : last_release + (half ? 2 : 1) * period - period / 4;
   if (earliest < now.QuadPart) {
     earliest = now.QuadPart;
   }
@@ -4556,7 +4557,7 @@ void set_overlay(bool visible, float distance_m, float width_m) {
 
 void recentre_overlay() {
   g_ovl_recentre.store(true);
-  g_cin_lazy.store(false);  // requested: always in front of the head
+  g_cin_lazy.store(false);  // Keep the panel in front of the headset.
   g_cin_recentre.store(true);
 }
 
@@ -4658,7 +4659,6 @@ void install() {
     g_new_image = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   }
   g_log_path = dir + L"\\XR_RUNTIME.log";
-  MoveFileExW(g_log_path.c_str(), (dir + L"\\XR_RUNTIME.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   log_line("xr runtime build %s %s pid=%lu control=AvatarVR_xr.txt (missing file = off) loader=static Khronos %u.%u.%u",
            __DATE__, __TIME__, GetCurrentProcessId(),
            static_cast<unsigned>(XR_VERSION_MAJOR(XR_CURRENT_API_VERSION)),
@@ -4684,10 +4684,9 @@ void set_queue(IUnknown* queue_or_device) {
 
 void on_present(IDXGISwapChain* swapchain) {
   update_framegen_status();
-  if (static_cast<Mode>(g_want.load(std::memory_order_relaxed)) != Mode::Cinema) {
-    return;
+  if (static_cast<Mode>(g_want.load(std::memory_order_relaxed)) == Mode::Cinema) {
+    copy_present(swapchain);
   }
-  copy_present(swapchain);
 }
 
 void set_sharpness(float percent) {

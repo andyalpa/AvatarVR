@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "time_sync.hpp"
 
 #include <windows.h>
@@ -46,14 +47,7 @@ void log_line(const char* fmt, ...) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, buffer, static_cast<DWORD>(std::strlen(buffer)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {buffer, "\r\n"});
 }
 
 std::wstring self_dir() {
@@ -135,7 +129,6 @@ void install() {
   }
   g_control_path = dir + L"\\AvatarVR_time.txt";
   g_log_path = dir + L"\\TIME_SYNC.log";
-  MoveFileExW(g_log_path.c_str(), (dir + L"\\TIME_SYNC.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   log_line("time sync build %s %s pid=%lu control=AvatarVR_time.txt (missing file = off)", __DATE__, __TIME__, GetCurrentProcessId());
 
   auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));

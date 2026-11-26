@@ -6,6 +6,7 @@ Reads the `gputimeline D ...` rows the GPU profiler logs (one sampled frame ever
 says "on N"). Fence labels: c = the game's compute queue, x = a copy queue, ? = a fence no profiled queue signals
 (e.g. DXGI / the headset runtime), d = the direct queue. Idle is the GPU gap before a submission.
 """
+from session_log import read_channel
 import re
 import sys
 from collections import defaultdict
@@ -24,7 +25,7 @@ def main():
     idle = defaultdict(float)
     count = defaultdict(int)
     busy = 0.0
-    for line in p.read_text(errors="replace").splitlines():
+    for line in read_channel(p, "DX12_OBSERVE").splitlines():
         if FRAME.search(line):
             frames += 1
             continue

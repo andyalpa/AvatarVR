@@ -2,11 +2,16 @@
 # Writes progress to build\cycle_status.txt and the full build output to build\cycle_build.log so a
 # remote session can follow along. Never touches afop.exe, References\, version.dll or version.ini.
 # The game is launched once and left for the user to close.
-param([int]$MaxMinutes = 8)
+param([int]$MaxMinutes = 8, [switch]$Profile)
 $ErrorActionPreference = 'Stop'
 $root    = Split-Path -Parent $PSScriptRoot            # ...\rogue\AvatarVR
-$build   = Join-Path $root 'build'
-$game    = if ($env:AFOP_GAME_ROOT) { $env:AFOP_GAME_ROOT } else { 'H:\Gaming\UbisoftLibrary\AFOP' }
+$build   = Join-Path $root 'build\playtest'
+if (-not $env:AFOP_GAME_ROOT) { throw 'Set AFOP_GAME_ROOT to the installed game folder.' }
+$game = (Resolve-Path -LiteralPath $env:AFOP_GAME_ROOT).Path
+if (-not (Test-Path -LiteralPath (Join-Path $game 'afop.exe') -PathType Leaf)) {
+  throw 'AFOP_GAME_ROOT does not contain afop.exe.'
+}
+New-Item -ItemType Directory -Path $build -Force | Out-Null
 $status  = Join-Path $build 'cycle_status.txt'
 $buildLog = Join-Path $build 'cycle_build.log'
 
@@ -17,10 +22,10 @@ function Say($msg) {
 }
 
 function Archive-Logs($tag) {
-  # Copy every observer log into scripts\runs\<timestamp>_<tag>\ so a later launch's rotation can never
+  # Copy observer logs into the build workspace so a later launch's rotation can never
   # overwrite a gameplay log again (run 7 was lost that way).
   $src = Join-Path $game 'scripts'
-  $runs = Join-Path $src 'runs'
+  $runs = Join-Path $build 'runs'
   $logs = @(Get-ChildItem $src -Filter '*.log' -File -ErrorAction SilentlyContinue)
   if ($logs.Count -eq 0) { return }
   $last = Get-ChildItem $runs -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
@@ -37,7 +42,7 @@ function Archive-Logs($tag) {
   if ($tag -eq 'before') {
     # These logs have no .prev rotation in the mod and only ever grew, so each archive repeated every earlier launch.
     # Before a launch they move into the run folder and the new session starts them empty.
-    $logs | Where-Object { $_.Name -match '^(BONE_COPY_PROBE|CODEDUMP|HAND_GESTURES|MOUNT_CAMERA|MOVE_NUDGE|MOVE_PROBE|MOVE_ROOMSCALE|POSE_PHASE_PROBE|SKIN_PALETTE_PROBE|VR_CONTROLS|VR_MENU|VR_WEAPON)\.log$' } |
+    $logs | Where-Object { $_.Name -match '^(AvatarVR|BONE_COPY_PROBE|CODEDUMP|HAND_GESTURES|MOUNT_CAMERA|MOVE_NUDGE|MOVE_PROBE|MOVE_ROOMSCALE|POSE_PHASE_PROBE|SKIN_PALETTE_PROBE|VR_CONTROLS|VR_MENU|VR_WEAPON)\.log$' } |
       ForEach-Object { Move-Item $_.FullName $dst -Force }
   }
   # Keep the newest 30 run folders here; older ones go to the archive next to the game folder (same drive), never deleted.
@@ -111,8 +116,12 @@ try {
     Say 'UNPACKED third_party\openxr-sdk from zip (first OpenXR build reconfigures and takes longer)'
   }
 
+  if (-not (Test-Path -LiteralPath (Join-Path $build 'CMakeCache.txt'))) {
+    & $cmake -S $root -B $build -G 'Visual Studio 18 2026' -A x64 *> $buildLog
+    if ($LASTEXITCODE) { Say 'CONFIGURE FAILED (see cycle_build.log)'; exit 1 }
+  }
   Push-Location $build
-  & $cmake --build . --config Release *> $buildLog
+  & $cmake --build . --config Release --parallel *>> $buildLog
   $rc = $LASTEXITCODE
   Pop-Location
   if ($rc -ne 0) { Say "BUILD FAILED rc=$rc (see cycle_build.log)"; exit 1 }
@@ -126,7 +135,20 @@ try {
   Say 'LOAD PROOF OK rc=0'
 
   Archive-Logs 'before'
-  Copy-Item $dll (Join-Path $game 'scripts\AvatarVR.dll') -Force
+  $installDir = Join-Path $game 'scripts'
+  New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+  $rollback = Join-Path $build ('rollback\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+  New-Item -ItemType Directory -Path $rollback -Force | Out-Null
+  foreach ($name in @('AvatarVR.dll', 'AvatarVR_settings.ini')) {
+    $installed = Join-Path $installDir $name
+    if (Test-Path -LiteralPath $installed) { Copy-Item -LiteralPath $installed -Destination $rollback }
+  }
+  $target = Join-Path $installDir 'AvatarVR.dll'
+  Copy-Item -LiteralPath $dll -Destination $target -Force
+  if ((Get-FileHash -LiteralPath $dll).Hash -ne (Get-FileHash -LiteralPath $target).Hash) {
+    throw "Deployment hash mismatch. Backup: $rollback"
+  }
+  Say "ROLLBACK $rollback"
   Say ("DEPLOYED bytes={0}" -f (Get-Item (Join-Path $game 'scripts\AvatarVR.dll')).Length)
 
   $launchedAt = Get-Date
@@ -150,26 +172,30 @@ try {
     if ($p.Count -gt 0) { Say "GAME RUNNING pids=$(($p | ForEach-Object ProcessId) -join ',')"; $seen = $true; break }
   }
   if (-not $seen) { Say 'GAME NOT SEEN within 3 min'; exit 1 }
-  # GPU monitor (2026-11-09, read-only nvidia-smi log -> scripts\GPU_MONITOR.log, archived with the other logs); it stops
-  # by itself when the game is gone. A failure to start it never stops the cycle.
-  try {
-    $gpuMon = Join-Path $root 'tools\perf\gpu_monitor.ps1'
-    if (Test-Path $gpuMon) {
-      Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', $gpuMon, '-LogPath', (Join-Path $game 'scripts\GPU_MONITOR.log'), '-MaxMinutes', ($MaxMinutes + 5)) | Out-Null
-      Say 'GPU MONITOR started (scripts\GPU_MONITOR.log)'
-    }
-  } catch { Say "GPU MONITOR not started: $($_.Exception.Message)" }
-  # Run fingerprint (2026-11-11, read-only -> scripts\RUN_FINGERPRINT.log, archived with the other logs): game settings,
-  # mod settings, DLL hash, power plan and other GPU programs at launch, for tools\perf\runs_report.py. Never stops the cycle.
-  try {
-    $fingerprint = Join-Path $root 'tools\perf\run_fingerprint.ps1'
-    if (Test-Path $fingerprint) {
-      Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', $fingerprint, '-Game', $game) | Out-Null
-      Say 'RUN FINGERPRINT written (scripts\RUN_FINGERPRINT.log)'
-    }
-  } catch { Say "RUN FINGERPRINT not written: $($_.Exception.Message)" }
+  if ($Profile) {
+    $profileDir = Join-Path $build ('profiles\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    # GPU monitor (2026-11-09, read-only nvidia-smi log -> GPU_MONITOR.log, archived with the other logs); it stops
+    # by itself when the game is gone. A failure to start it never stops the cycle.
+    try {
+      $gpuMon = Join-Path $root 'tools\perf\gpu_monitor.ps1'
+      if (Test-Path $gpuMon) {
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+          '-File', $gpuMon, '-LogPath', (Join-Path $profileDir 'GPU_MONITOR.log'), '-MaxMinutes', ($MaxMinutes + 5)) | Out-Null
+        Say 'GPU MONITOR started (GPU_MONITOR.log)'
+      }
+    } catch { Say "GPU MONITOR not started: $($_.Exception.Message)" }
+    # Run fingerprint (2026-11-11, read-only -> RUN_FINGERPRINT.log, archived with the other logs): game settings,
+    # mod settings, DLL hash, power plan and other GPU programs at launch, for tools\perf\runs_report.py. Never stops the cycle.
+    try {
+      $fingerprint = Join-Path $root 'tools\perf\run_fingerprint.ps1'
+      if (Test-Path $fingerprint) {
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+          '-File', $fingerprint, '-Game', $game, '-LogPath', (Join-Path $profileDir 'RUN_FINGERPRINT.log')) | Out-Null
+        Say 'RUN FINGERPRINT written (RUN_FINGERPRINT.log)'
+      }
+    } catch { Say "RUN FINGERPRINT not written: $($_.Exception.Message)" }
+  }
   # Watchdog: GPU-safety cap. The game must never be left running.
   $stop = (Get-Date).AddMinutes($MaxMinutes)
   Say "WATCHDOG armed: game will be closed at $($stop.ToString('HH:mm:ss')) if still running"

@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "xr_input.hpp"
 #include "hand_gesture_bindings.hpp"
 
@@ -40,20 +41,13 @@ void log_line(const char* fmt, ...) {
       std::wstring dir(path);
       dir = dir.substr(0, dir.find_last_of(L"\\/"));
       g_log_path = dir + L"\\XR_INPUT.log";
-      MoveFileExW(g_log_path.c_str(), (dir + L"\\XR_INPUT.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
     }
-  }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
   }
   SYSTEMTIME t;
   GetLocalTime(&t);
   char line[700];
   const int n = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u %s\r\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, buffer);
-  DWORD written = 0;
-  WriteFile(file, line, static_cast<DWORD>(n > 0 ? n : 0), &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {std::string_view(line, n > 0 && n < static_cast<int>(sizeof(line)) ? n : 0)});
 }
 
 // ---- actions --------------------------------------------------------------------------------------------
@@ -561,7 +555,11 @@ void sync(XrSession session) {
     g_raw = s;
     g_state_tick = now;
     g_focused = focused;
-    sensor.at=now; sensor.sequence=++g_sensor_sequence; sensor.focused=focused && !g_menu_open.load(std::memory_order_relaxed);
+    // [AUTHOR 2026-11-17] Menu open: gestures keep running (the Hands tab previews poses on the hand) but see
+    // neutral controls, so menu buttons never move fingers. Was: focused=false, which switched gestures off.
+    if(g_menu_open.load(std::memory_order_relaxed))
+      for(auto& hand:sensor.hand) {const bool tracked=hand.tracked; hand=hand_gestures::Sensors{}; hand.tracked=tracked;}
+    sensor.at=now; sensor.sequence=++g_sensor_sequence; sensor.focused=focused;
     g_pending_sensor=sensor;
     if(!sensor.focused) g_sensor_state={};
   }

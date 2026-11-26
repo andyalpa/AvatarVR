@@ -1,5 +1,6 @@
 """Pose editor model, persistence, runtime default parity and isolated Tk smoke tests."""
 from pathlib import Path
+import os
 import json
 import math
 import subprocess
@@ -47,7 +48,8 @@ class GestureTunerTests(unittest.TestCase):
         self.assertEqual(helper[HELPERS[5] + ".scale_x"], 30)
 
     def test_runtime_default_parity(self):
-        binary = REPO / "build/hand_gestures/bin/hand_gestures_test.exe"
+        bin_dir = Path(os.environ.get("AVATARVR_TEST_BIN", REPO / "build/bin"))
+        binary = bin_dir / "hand_gestures_test.exe"
         output = subprocess.check_output([str(binary), "--defaults"], text=True)
         count = 0
         for line in output.splitlines():
@@ -104,12 +106,13 @@ class GestureTunerTests(unittest.TestCase):
                 status = {"at":time.time(),"mounted":1,"context_ready":1,"native_owned":0,
                           "owners":[1,5],"weight":[1,0],"combo":[11,12],"grip":[1,0],"trigger":[1,0],
                           "index_touch":[1,0],"thumb_touch":[1,0],"applications":1,"rejects":0}
-                (Path(directory)/"AvatarVR_gesture_status.json").write_text(json.dumps(status))
+                (Path(directory)/"AvatarVR"/"state").mkdir(parents=True)
+                (Path(directory)/"AvatarVR"/"state"/"AvatarVR_gesture_status.json").write_text(json.dumps(status))
                 app.gestures.poll()
                 self.assertIn("Mounted", app.gestures.live.get())
                 self.assertIn("harness", app.gestures.live.get())
                 status["tracked"] = [0, 1]
-                (Path(directory)/"AvatarVR_gesture_status.json").write_text(json.dumps(status))
+                (Path(directory)/"AvatarVR"/"state"/"AvatarVR_gesture_status.json").write_text(json.dumps(status))
                 app.gestures.poll()
                 self.assertIn("Left controller NOT TRACKED", app.gestures.live.get())
                 # Capture: request keys go out, matching answer lands in the selected combination.
@@ -124,7 +127,7 @@ class GestureTunerTests(unittest.TestCase):
                 answer = {"id": app.gestures.capture_id, "hand": "right", "context": "tp", "position_mm": 1.5,
                           "angle_deg": 2, "clamped": 0, "values": {"index.bend1": 33, "thumb.roll1": 7,
                                                                     "thumb_01_expand01.scale_x": 500, "bogus.key": 1}}
-                (Path(directory)/"AvatarVR_gesture_capture.json").write_text(json.dumps(answer))
+                (Path(directory)/"AvatarVR"/"state"/"AvatarVR_gesture_capture.json").write_text(json.dumps(answer))
                 app.gestures.poll()
                 self.assertEqual(app.gestures.current, ("tp", "right", 12))
                 self.assertEqual(app.gestures.context.get(), "Mounted")
@@ -183,7 +186,9 @@ class GestureTunerTests(unittest.TestCase):
                 g.reset();app.write()
                 saved = ik_tuner.read_kv(tune, "=")
                 self.assertFalse(any(k.startswith("gesture.fp.left.open.") for k in saved), "reset mirrors too")
-                self.assertTrue(json.loads((Path(directory)/"AvatarVR_tuner_prefs.json").read_text())["mirror_hands"])
+                self.assertTrue(json.loads(ik_tuner.settings_store.read(Path(directory)/"AvatarVR_tuner_prefs.json"))["mirror_hands"])
+                self.assertFalse((Path(directory)/"AvatarVR_tuner_prefs.json").exists())
+                self.assertTrue((Path(directory)/"AvatarVR_settings.ini").is_file())
                 self.assertTrue(ik_tuner.GestureEditor.prefs(g)["mirror_hands"])
                 app.close()
                 saved = ik_tuner.read_kv(tune, "=")

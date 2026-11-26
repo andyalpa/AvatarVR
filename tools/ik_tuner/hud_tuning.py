@@ -3,6 +3,8 @@
 Writes <game>/scripts/AvatarVR_hud_widgets.txt on every change; the mod re-reads it about 4 times a second while
 F10 -> UI -> Native HUD on arm is on. Defaults here must match PlacementDefaults in src/camera/ui_ownership.cpp.
 """
+import io
+import settings_store
 import json
 import os
 import tkinter as tk
@@ -60,7 +62,7 @@ def read_bones(path):
 def read_values(path):
     values = {e[0]: defaults(e) for e in ELEMENTS}
     try:
-        with open(path, encoding="utf-8") as stream:
+        with io.StringIO(settings_store.read(path)) as stream:
             for line in stream:
                 name, _, value = line.strip().partition("=")
                 element, _, field = name.partition(".")
@@ -73,7 +75,7 @@ def read_values(path):
 
 def read_frame(path):
     try:
-        with open(path, encoding="utf-8") as stream:
+        with io.StringIO(settings_store.read(path)) as stream:
             for line in stream:
                 if line.startswith("settings.frame="):
                     return int(float(line.split("=")[1]))
@@ -96,11 +98,10 @@ class HudWizard:
         self.groups_path = os.path.join(scripts, GROUPS_FILE)
         self.groups = dict(DEFAULT_GROUPS)
         try:
-            with open(self.groups_path, encoding="utf-8") as stream:
-                self.groups.update(json.load(stream))
+            self.groups.update(json.loads(settings_store.read(self.groups_path)))
         except (OSError, ValueError):
             pass
-        self.bones_path = os.path.join(scripts, BONES_FILE)
+        self.bones_path = os.path.join(scripts, "AvatarVR", "state", BONES_FILE)
         self.bones = read_bones(self.bones_path)
         self.pending = None
         self.loading = False
@@ -255,8 +256,7 @@ class HudWizard:
     def save_groups(self):
         self.group_box["values"] = sorted(self.groups)
         try:
-            with open(self.groups_path, "w", encoding="utf-8") as stream:
-                json.dump(self.groups, stream, indent=2)
+            settings_store.write(self.groups_path, json.dumps(self.groups, indent=2))
         except OSError as error:
             self.status.set("Could not save groups: %s" % error)
 
@@ -322,10 +322,7 @@ class HudWizard:
     def write(self):
         self.pending = None
         try:
-            temporary = self.path + ".tmp"
-            with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-                stream.write(render(self.values, self.frame.get()))
-            os.replace(temporary, self.path)
+            settings_store.write(self.path, render(self.values, self.frame.get()))
             self.status.set("Saved " + self.path)
         except OSError as error:
             self.status.set("Could not save: %s" % error)

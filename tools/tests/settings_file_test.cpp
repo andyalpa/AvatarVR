@@ -71,6 +71,21 @@ int main() {
   settings_file::migrate(dir);
   check(settings_file::read(native, text, sizeof(text)) && std::strncmp(text, "second 3", 8) == 0, "next load imports the dropped-in file");
 
+  const auto tune = dir + L"\\AvatarVR_ik_tune.txt";
+  const auto lua = dir + L"\\avr\\tunables.txt";
+  CreateDirectoryW((dir + L"\\avr").c_str(), nullptr);
+  const std::string large_tune(100000, 'x');
+  put(tune, large_tune.c_str());
+  put(lua, "sample=2\n");
+  settings_file::migrate(dir);
+  std::string full;
+  check(settings_file::read(tune, full) && full.starts_with(large_tune), "large tuning section survives without truncation");
+  check(!exists(tune), "legacy tune archived");
+  check(settings_file::read(lua, full) && full == "sample=2\n", "nested Lua tunables imported into the same INI");
+  put(tune, "stale=1\n");
+  settings_file::migrate(dir);
+  check(settings_file::read(tune, full) && full.starts_with(large_tune), "stale tuning file cannot replace migrated data");
+
   std::printf(failures ? "settings_file_test: %d FAILED\n" : "settings_file_test: all passed\n", failures);
   return failures ? 1 : 0;
 }

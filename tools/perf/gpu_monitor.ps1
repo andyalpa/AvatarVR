@@ -7,7 +7,7 @@
 # Started by tools\run_cycle.ps1 once afop.exe is running; it stops by itself when the game is gone for 20 s or after
 # MaxMinutes. Can also be run by hand:  powershell -File tools\perf\gpu_monitor.ps1
 param(
-  [string]$LogPath = 'H:\Gaming\UbisoftLibrary\AFOP\scripts\GPU_MONITOR.log',
+  [Parameter(Mandatory)][string]$LogPath,
   [int]$IntervalSec = 2,
   [int]$ProcessSec = 10,
   [string]$GameProcess = 'afop',

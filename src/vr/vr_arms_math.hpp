@@ -151,7 +151,7 @@ inline void blend_affine(const float* a, const float* b, float t, float* out) {
 }
 inline float smoothstep(float t) { t = t < 0.f ? 0.f : t > 1.f ? 1.f : t; return t * t * (3.f - 2.f * t); }
 
-// Run 67 two-hand aiming (Cyberpunk VR port TwoHandGrip rules): the gun swings about the dominant grip so the line
+// Two-hand aiming: the gun swings about the dominant grip so the line
 // dominant grip -> support point turns toward dominant grip -> support controller. Shortest arc (no roll about the
 // barrel: the roll stays with the dominant wrist), the first `deadzone` radians of error ignored, `fraction` of the
 // rest applied, capped at `ceiling`. Row-vector rotation rows: v' = v * R.

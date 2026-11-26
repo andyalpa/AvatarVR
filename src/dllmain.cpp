@@ -1,3 +1,4 @@
+#include "runtime_log.hpp"
 #include "camera/camera.hpp"
 #include "diagnostics/upload_sampler.hpp"
 #include "dx12/dx12.hpp"
@@ -56,27 +57,6 @@ std::string wide_to_utf8(const std::wstring& text) {
   std::string out(static_cast<size_t>(bytes), '\0');
   WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), bytes, nullptr, nullptr);
   return out;
-}
-
-bool write_bytes(const std::wstring& path, const std::string& text, bool append) {
-  const DWORD access = append ? FILE_APPEND_DATA : GENERIC_WRITE;
-  const DWORD disposition = append ? OPEN_ALWAYS : CREATE_ALWAYS;
-  HANDLE file = CreateFileW(path.c_str(), access, FILE_SHARE_READ, nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return false;
-  }
-  DWORD written = 0;
-  const BOOL ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-  CloseHandle(file);
-  return ok && written == text.size();
-}
-
-void rotate_log(const std::wstring& log_path) {
-  const std::wstring previous = join_path(parent_dir(log_path), L"LOAD_PROOF.prev.log");
-  if (GetFileAttributesW(log_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    return;
-  }
-  MoveFileExW(log_path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 std::string sha256_file(const std::wstring& path) {
@@ -183,8 +163,8 @@ DWORD WINAPI detail_thread(LPVOID param) {
   extra += module_line(L"dxgi.dll");
   extra += module_line(L"d3d12.dll");
   extra += module_line(L"d3d12core.dll");
-  extra += "detail_complete\r\n";
-  write_bytes(work->log_path, extra, true);
+  extra += "detail_complete pid=" + std::to_string(GetCurrentProcessId()) + "\r\n";
+  runtime_log::append(work->log_path, {extra});
   return 0;
 }
 
@@ -220,7 +200,18 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     return TRUE;
   }
   DisableThreadLibraryCalls(instance);
-  settings_file::migrate(parent_dir(module_path(instance)));  // before any module reads its settings
+  const auto scripts = parent_dir(module_path(instance));
+  settings_file::migrate(scripts);  // before any module reads its settings
+  const auto runtime = join_path(scripts, L"AvatarVR");
+  CreateDirectoryW(runtime.c_str(), nullptr);
+  const auto state = join_path(runtime, L"state");
+  CreateDirectoryW(state.c_str(), nullptr);
+  for (const wchar_t* name : {L"AvatarVR_hand_references.txt", L"AvatarVR_weapon_holds.txt"}) {
+    const auto old_path = join_path(scripts, name);
+    const auto new_path = join_path(state, name);
+    MoveFileExW(old_path.c_str(), new_path.c_str(), 0);
+  }
+  runtime_log::rotate_if_large(scripts);
   camera::install();
   upload::install();
   dx12::install();
@@ -230,15 +221,14 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
   const std::wstring config_path = join_path(parent_dir(host_path), L"version.ini");
   const std::wstring log_path = join_path(parent_dir(dll_path), L"LOAD_PROOF.log");
 
-  rotate_log(log_path);
-  write_bytes(log_path, header_text(dll_path, config_path, host_path), false);
+  runtime_log::append(log_path, {header_text(dll_path, config_path, host_path)});
 
   auto work = std::make_unique<DetailWork>();
   work->log_path = log_path;
   work->host_path = host_path;
   HANDLE thread = CreateThread(nullptr, 0, detail_thread, work.get(), 0, nullptr);
   if (thread == nullptr) {
-    write_bytes(log_path, "detail_error thread\r\n", true);
+    runtime_log::append(log_path, {"detail_error thread pid=" + std::to_string(GetCurrentProcessId())});
     return TRUE;
   }
   work.release();

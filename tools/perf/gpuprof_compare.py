@@ -8,6 +8,7 @@ it prints, per frame: GPU busy time, span, the per-view split (main / second / n
 (starved = GPU waited for the game's CPU; wait = cross-queue fence; other), and the submission positions whose GPU time
 differs most. Added 2026-11-09 for the main-menu-panel performance question (dev notes "Panel vs follow-head").
 """
+from session_log import read_channel
 import os
 import re
 import sys
@@ -29,7 +30,7 @@ def parse(path):
     """Frame-weighted averages over the blocks reported while stereo was running."""
     q = {}
     running = False
-    for line in open(path, encoding="utf-8", errors="replace"):
+    for line in read_channel(path, "DX12_OBSERVE").splitlines():
         line = line.rstrip("\n")
         m = HEAD.search(line)
         if m:

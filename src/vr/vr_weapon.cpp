@@ -15,9 +15,12 @@
 // The caller's buffers are never modified; the producer runs exactly once with the original remaining arguments.
 // Off (default, not persisted): read-only logging of start/target/third and the aim-object state, 1 line per second.
 // Log: scripts\VR_WEAPON.log. Rollback: toggle off, or the previous DLL.
+#include "../runtime_log.hpp"
 #include "vr_weapon.hpp"
 #include "vr_weapon_math.hpp"
 #include "vr_arms_math.hpp"
+#include "vr_recoil.hpp"
+#include "bow_draw.hpp"
 #include "../diagnostics/skin_palette_probe.hpp"
 #include "../camera/mount_camera.hpp"
 #include "../game/player.hpp"
@@ -55,10 +58,7 @@ void log(const char* text) {
     if(!GetModuleFileNameW(self,path,MAX_PATH)) return;
     dir=path; dir=dir.substr(0,dir.find_last_of(L"\\/"));
   }
-  HANDLE file=CreateFileW((dir+L"\\VR_WEAPON.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
-  if(file==INVALID_HANDLE_VALUE) return;
-  DWORD n; WriteFile(file,text,static_cast<DWORD>(std::strlen(text)),&n,nullptr); WriteFile(file,"\r\n",2,&n,nullptr);
-  CloseHandle(file);
+  runtime_log::append(dir+L"\\VR_WEAPON.log", {text, "\r\n"});
 }
 const unsigned char* ptr(const void* base,unsigned offset) {
   const unsigned char* value=nullptr;
@@ -596,7 +596,8 @@ void move_weapon_world(unsigned char* weapon,const char* phase) {
 // call (~60/s); at rest it lies 4-15 deg from the drawn arrow in the bow's frame (arrow_in_root 0.31/0.54 vs 0.90 m), so no one
 // fixed ray fits both. So a bow follows this frame's arrow (wrist frame, half-step smoothing per sample), held while unseen.
 struct ShotAim {const void* weapon=nullptr; int hand=-1; vr_weapon_math::SteadyRay steady; float distance=30.f; ULONGLONG at=0,since=0;
-                bool bow=false; skin_arm_ik::Vec bow_origin{},bow_forward{}; ULONGLONG bow_at=0;};
+                bool bow=false; skin_arm_ik::Vec bow_origin{},bow_forward{}; ULONGLONG bow_at=0;
+                bool bow_full=false;};  // FEATURE-07: the bow ray was learned at the game's full draw
 // The ray the reticle and shots use, in the wrist frame: a bow's arrow, else the locked steady ray.
 bool current_ray(const ShotAim& aim,ULONGLONG,skin_arm_ik::Vec& origin,skin_arm_ik::Vec& forward) {
   if(aim.bow) {if(!aim.bow_at) return false; origin=aim.bow_origin; forward=aim.bow_forward; return true;}
@@ -605,7 +606,8 @@ bool current_ray(const ShotAim& aim,ULONGLONG,skin_arm_ik::Vec& origin,skin_arm_
 }
 std::mutex shot_aim_mutex;
 ShotAim shot_aim_state;
-struct KnownRay {const void* weapon=nullptr; int hand=-1; vr_weapon_math::SteadyRay steady; bool bow=false;};
+struct KnownRay {const void* weapon=nullptr; int hand=-1; vr_weapon_math::SteadyRay steady; bool bow=false;
+                 bool bow_full=false; skin_arm_ik::Vec bow_origin{},bow_forward{};};
 KnownRay known_rays[8];  // shot_aim_mutex; most recent first
 std::atomic<unsigned> aim_casts{0},aim_hits{0},aim_locks{0},aim_restores{0},aim_changes{0},bow_samples{0},bow_rejects{0};
 std::atomic<ULONGLONG> aim_next_line{0};
@@ -634,11 +636,13 @@ void note_shot_ray(const void* weapon,const float* start,const float* target,con
     if(state.steady.locked || state.bow) {  // keep the old one, newest first
       for(int i=0;i<7;++i) if(known_rays[i].weapon==state.weapon && known_rays[i].hand==state.hand) {slot=i; break;}
       for(int i=slot;i>0;--i) known_rays[i]=known_rays[i-1];
-      known_rays[0]={state.weapon,state.hand,state.steady,state.bow};
+      known_rays[0]={state.weapon,state.hand,state.steady,state.bow,state.bow_full,state.bow_origin,state.bow_forward};
     }
-    state.weapon=weapon; state.hand=hand; state.steady={}; state.bow=false; state.bow_at=0; state.since=now; aim_changes.fetch_add(1,std::memory_order_relaxed);
+    state.weapon=weapon; state.hand=hand; state.steady={}; state.bow=false; state.bow_at=0; state.bow_full=false; state.since=now; aim_changes.fetch_add(1,std::memory_order_relaxed);
     for(const auto& known:known_rays) if(known.weapon==weapon && known.hand==hand) {
-      state.steady=known.steady; state.steady.try_last=0; state.bow=known.bow; aim_restores.fetch_add(1,std::memory_order_relaxed); break;}
+      state.steady=known.steady; state.steady.try_last=0; state.bow=known.bow; aim_restores.fetch_add(1,std::memory_order_relaxed);
+      if(known.bow_full) {state.bow_full=true; state.bow_origin=known.bow_origin; state.bow_forward=known.bow_forward; state.bow_at=now;}
+      break;}
   }
   state.at=now;
   // A weapon that has shown an arrow is a bow from then on: it aims along its arrow, never the game's aim.
@@ -646,6 +650,14 @@ void note_shot_ray(const void* weapon,const float* start,const float* target,con
   if(state.bow) {
     if(!bow_ok) {bow_rejects.fetch_add(1,std::memory_order_relaxed); return;}
     bow_samples.fetch_add(1,std::memory_order_relaxed);
+    // FEATURE-07 (HEADSET 2026-11-18): with the string pull, aim follows the bow hand only. The ray lives in the bow
+    // hand's wrist frame; it is learned only when the game's draw is full and settled (part-drawn arrows run ~32 deg off,
+    // resting ones 4-15 deg), and held through the manual pull and between draws.
+    if(*bow_draw::enabled_flag() && state.bow_at) {
+      const bool learn=bow_draw::pulling() && bow_draw::native_full();
+      if(!learn && (bow_draw::pulling() || state.bow_full)) {state.bow_at=now; return;}
+      if(learn) state.bow_full=true;
+    }
     if(!state.bow_at || now-state.bow_at>250) {state.bow_origin=bow_o; state.bow_forward=bow_f;}
     else {
       using namespace skin_arm_ik;
@@ -682,6 +694,7 @@ void cast_shot_ray() {
     skin_arm_ik::Vec o,f;
     if(!current_ray(aim,now,o,f) || now-aim.at>250 || !skin_palette_probe::weapon_attach_matrices(hand,flat,ik) || !wrist_of_gun(hand,ik,frame)) return;
     origin[0]=o.x; origin[1]=o.y; origin[2]=o.z; forward[0]=f.x; forward[1]=f.y; forward[2]=f.z;
+    if(!aim.bow) vr_recoil::unkick_ray(hand,origin,forward);  // the wrist is kicked; the ray keeps the un-kicked aim
   }
   for(int k=0;k<3;++k) {
     start[k]=frame[12+k]; float way=0.f;
@@ -764,8 +777,9 @@ bool steady_aim_point(const void* weapon,int hand,const float* ik,float* frame,f
   skin_arm_ik::Vec ro,rf;
   if(aim.weapon!=weapon || aim.hand!=hand || !current_ray(aim,GetTickCount64(),ro,rf) || !wrist_of_gun(hand,ik,frame)) return false;
   if(is_bow) *is_bow=aim.bow;
-  const float o[3]={ro.x,ro.y,ro.z};
-  const float f[3]={rf.x,rf.y,rf.z};
+  float o[3]={ro.x,ro.y,ro.z};
+  float f[3]={rf.x,rf.y,rf.z};
+  if(!aim.bow) vr_recoil::unkick_ray(hand,o,f);  // shots and reticle keep the un-kicked aim (recoil is visual only)
   float start[3],way[3];
   for(int k=0;k<3;++k) {
     start[k]=frame[12+k]; way[k]=0.f;
@@ -1037,6 +1051,7 @@ bool shot_distance(float* distance) {
   *distance=shot_aim_state.distance; return true;
 }
 bool shot_ray_on() {return write_permission.load(std::memory_order_relaxed);}
+bool held_is_bow() {std::lock_guard<std::mutex> lock(shot_aim_mutex); return shot_aim_state.bow;}
 bool shot_aim(float* origin,float* forward,float* distance) {
   std::lock_guard<std::mutex> lock(shot_aim_mutex);
   const ULONGLONG now=GetTickCount64(); skin_arm_ik::Vec o,f;
@@ -1060,6 +1075,7 @@ void timing_offer(const void* gun_bone0) {
   log("gun timing: 3 s window started (view turning, gun in hand)");
 }
 void on_present() {
+  vr_recoil::on_present();
   watch_poll();
   timing_poll();
   {const game::Pointers p=game::pointers();

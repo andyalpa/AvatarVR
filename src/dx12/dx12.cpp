@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "dx12.hpp"
 
 #include "../camera/camera.hpp"
@@ -122,14 +123,7 @@ void log_line(const std::string& text) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {text, "\r\n"});
 }
 
 void logf(const char* fmt, ...) {
@@ -140,14 +134,6 @@ void logf(const char* fmt, ...) {
   va_end(args);
   buffer[sizeof(buffer) - 1] = '\0';
   log_line(buffer);
-}
-
-void rotate_log() {
-  if (g_log_path.empty() || GetFileAttributesW(g_log_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    return;
-  }
-  const std::wstring previous = parent_dir(g_log_path) + L"\\DX12_OBSERVE.prev.log";
-  MoveFileExW(g_log_path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 const char* format_name(DXGI_FORMAT format) {
@@ -549,8 +535,8 @@ void log_present_sample(IDXGISwapChain* swapchain, UINT sync, UINT flags, HRESUL
 
 // ---- eye buffers (eye mode, 2026-10-09) ------------------------------------------------------------------------
 // Run 18:20-18:24: the main view's final image always goes to the display, whatever the offscreen byte says, so in a
-// widescreen window the eye-sized left image was clipped. Cyberpunk VR's lever now works here because the render size
-// no longer follows the swapchain (native_stereo's size override): with "eyesize W H both", the swapchain buffers are
+// widescreen window the eye-sized left image was clipped. The native stereo size override separates render resolution
+// from swapchain size: with "eyesize W H both", the swapchain buffers are
 // made at least W x H while the window keeps its own size. The engine renders into the top-left of the buffers (eye
 // size in gameplay, the window's client size in menus), and IDXGISwapChain2::SetSourceSize presents only the
 // client-size top-left region, so the monitor shows it 1:1. xr_runtime copies the left eye from the top-left W x H and
@@ -2222,7 +2208,6 @@ void hook_loader_exports() {
 }
 
 DWORD WINAPI install_thread(LPVOID) {
-  rotate_log();
   logf("dx12 observer build %s %s thread=%lu", __DATE__, __TIME__, GetCurrentThreadId());
   frame_capture::install();
   xr_runtime::install();

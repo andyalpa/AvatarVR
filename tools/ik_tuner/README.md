@@ -147,3 +147,11 @@ copy. The toggle is remembered in `AvatarVR_tuner_prefs.json`.
 Turn on **F10 > UI > Native HUD on arm**, then open the **HUD on arm** tab. Pick an element, choose where it attaches (arm, hand, weapon, or a specific bone), then move, turn and size it. Changes save to `scripts/AvatarVR_hud_widgets.txt` and show in the headset within a moment. The bone list appears after the mod has run once in gameplay; use **Reload bone list**.
 Select several elements with Ctrl+click or Shift+click to move them together, or save the selection as a group. **Bottom HUD** is built in; **Line up selected** gives the health bar, energy and prompts the same values, which restores the game's arrangement.
 
+
+## Tuning inside VR (Tuner tab)
+
+The VR mod menu has a **Tuner** tab with this tuner's pages: **Fingers** (poses, thumb helpers, capture, mirror,
+copy/paste), **Mounted arms**, **HUD on arm** and **Full-view effects**. Pick the page in the first row; values change
+with left/right and apply live, in the same files as this tuner. Close this desktop tuner while tuning in VR: it
+rewrites the files from its own state and would undo the menu's edits. HUD group save/delete and presets are still
+only here.

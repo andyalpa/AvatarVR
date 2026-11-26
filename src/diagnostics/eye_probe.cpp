@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "eye_probe.hpp"
 
 #include <windows.h>
@@ -89,14 +90,7 @@ void write_line(const char* text) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, text, static_cast<DWORD>(std::strlen(text)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {text, "\r\n"});
 }
 
 void logf(const char* fmt, ...) {
@@ -323,8 +317,6 @@ void install() {
   const std::wstring dir = self_dir();
   if (!dir.empty()) {
     g_log_path = dir + L"\\EYE_PROBE.log";
-    const std::wstring prev = dir + L"\\EYE_PROBE.prev.log";
-    MoveFileExW(g_log_path.c_str(), prev.c_str(), MOVEFILE_REPLACE_EXISTING);
   }
   logf("eye probe build %s %s pid=%lu", __DATE__, __TIME__, GetCurrentProcessId());
 

@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "hitch_probe.hpp"
 
 #include <windows.h>
@@ -40,17 +41,11 @@ void logf(const char* fmt, ...) {
   if (g_log_path.empty()) return;
   // Opened per line through the ORIGINAL file API pointers would still be counted as our own writes; the log is only
   // written on hitches and every 10 s, so its own cost is visible and tiny.
-  HANDLE f = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (f == INVALID_HANDLE_VALUE) return;
   SYSTEMTIME t;
   GetLocalTime(&t);
   char stamp[32];
-  const int sn = snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u.%03u ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
-  DWORD w = 0;
-  WriteFile(f, stamp, static_cast<DWORD>(sn), &w, nullptr);
-  WriteFile(f, buffer, static_cast<DWORD>(strlen(buffer)), &w, nullptr);
-  WriteFile(f, "\r\n", 2, &w, nullptr);
-  CloseHandle(f);
+  snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u.%03u ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+  runtime_log::append(g_log_path, {stamp, buffer, "\r\n"});
 }
 
 std::uint64_t qpc_us() {
@@ -150,7 +145,6 @@ void install(const wchar_t* scripts_dir) {
   CloseHandle(c);
   if (strncmp(text, "on", 2) != 0) return;
   g_log_path = std::wstring(scripts_dir) + L"\\HITCH_PROBE.log";
-  MoveFileExW(g_log_path.c_str(), (std::wstring(scripts_dir) + L"\\HITCH_PROBE.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   logf("hitch probe build %s %s pid=%lu: frames > 40 ms in gameplay are itemised (count / total ms / longest ms @thread)",
        __DATE__, __TIME__, GetCurrentProcessId());
   HMODULE k = GetModuleHandleW(L"kernelbase.dll");

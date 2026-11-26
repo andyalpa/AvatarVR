@@ -88,14 +88,21 @@ void set_render_size(unsigned width, unsigned height);
 // Pose identity: the applied head-pose snapshot the newest second-view output was rendered with (both eyes are built
 // from the same snapshot). False when unknown; callers fall back to the lag-based views_for_present().
 bool presented_views(head_pose::Snapshot* out);
+// The whole applied snapshot (both eyes) of the frame the main view (left eye) is presenting. AFW: a right eye rebuilt
+// from this frame's left eye is labelled with this snapshot's right eye.
+bool present_snapshot_left(head_pose::Snapshot* out);
+// Applied-pose id (0 = unknown) of the frame a view is rendering, from its render-side slot (+0x9EC8): which 0 = main
+// (left), 1 = second view (right). Render threads: tags AFW captures with their frame.
+std::uint64_t render_pose_id(int which);
+// Present thread: the left eye's frame id (returned) and the newest right-eye output's frame id (*right_out). Equal =
+// the right eye rendered the presented frame; smaller = it was skipped.
+std::uint64_t present_ids(std::uint64_t* right_out);
 // Retire the second view and build a fresh one on the next StartFrame (what a loading screen does). Used by the
 // dark-right-eye watchdog in xr_runtime.
 void request_rebuild(const char* why);
 // True while the second view renders the right eye (gameplay); false on the start-up screens, in the game's menus
 // (pause, inventory, character), while switched off, and before the second view exists.
 bool stereo_running();
-// True while gameplay has been seen and stereo is about to start (the gate's on-streak, or the second view not built
-// yet): the flat picture on the headset is then gameplay, which xr_runtime hides behind black (menu_transition.hpp).
 bool stereo_pending();
 // True when the last stereo pause was a pause menu (main view stopped), not a load, the front end or a resize.
 bool stereo_paused_by_menu();

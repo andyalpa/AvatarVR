@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "dlss_twin.hpp"
 
 #include "../camera/eye_write.hpp"
@@ -96,14 +97,7 @@ void log_line(const char* fmt, ...) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, buffer, static_cast<DWORD>(std::strlen(buffer)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {buffer, "\r\n"});
 }
 
 std::wstring self_dir() {
@@ -873,7 +867,8 @@ SlResult Evaluate_hook(SlFeature feature, const void* frame, const SlBase** inpu
     tag_info->tag_used[0] = s0;
     tag_info->tag_used[1] = s1;
   }
-  if ((mv_repair::enabled() || g_mv_burst.load() || xr_depth::enabled() || frame_gen::enabled()) && cmd != nullptr && tags_fresh) {
+  if ((mv_repair::enabled() || g_mv_burst.load() || xr_depth::enabled() || frame_gen::enabled()) && cmd != nullptr &&
+      tags_fresh) {
     unsigned main_id = 0, second_id = 0;
     VpInfo* info = tag_info;
     if (info != nullptr && native_stereo::stereo_viewport_ids(&main_id, &second_id) &&
@@ -916,7 +911,7 @@ SlResult Evaluate_hook(SlFeature feature, const void* frame, const SlBase** inpu
           mv_grab(viewport->value, 1, cmd, pair, 'b');
           mv_grab(viewport->value, 0, cmd, pair, 'b');
         }
-        if (mv_repair::enabled()) mv_repair::repair_right(list, eye);  // before DLSS reads its motion vectors
+        if (mv_repair::enabled()) mv_repair::repair_right(list, eye);  // before DLSS reads MVs
         if (frame_gen::enabled()) {  // after the repair, so the second view's copy has the repaired vectors
           frame_gen::capture(1, list, eye.mv, eye.mv_state, eye.depth, eye.depth_state, consts + kMvecScale / 4,
                              {info->ext_l[1].load(), info->ext_t[1].load(), info->ext_w[1].load(), info->ext_h[1].load()},
@@ -991,13 +986,12 @@ void install() {
   xr_depth::set_log(&log_line);
   frame_gen::set_log(&log_line);
   {
-    const std::wstring cap = dir + L"\\captures";
+    const std::wstring cap = dir + L"\\AvatarVR\\captures";
     CreateDirectoryW(cap.c_str(), nullptr);
     char narrow[MAX_PATH] = {};
     WideCharToMultiByte(CP_ACP, 0, cap.c_str(), -1, narrow, sizeof(narrow), nullptr, nullptr);
     g_capture_dir = narrow;
   }
-  MoveFileExW(g_log_path.c_str(), (dir + L"\\DLSS_TWIN.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   log_line("dlss twin build %s %s pid=%lu control=AvatarVR_dlss.txt (twin|off; missing = off) twin viewport = id + 0x%X",
            __DATE__, __TIME__, GetCurrentProcessId(), kTwinOffset);
 }

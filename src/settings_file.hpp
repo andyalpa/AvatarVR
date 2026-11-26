@@ -2,7 +2,7 @@
 // One settings file: scripts\AvatarVR_settings.ini holds a [section] with the verbatim text of each former
 // scripts\AvatarVR_<section>.txt, so every module keeps its own format and only changes where the text lives.
 // Callers still pass the old path; only names in kSections are redirected. Debug switches such as
-// AvatarVR_hitch.txt stay separate files that exist only while in use, and tuner data files are not touched.
+// AvatarVR_hitch.txt stay separate files that exist only while in use, while persistent tuning shares this store.
 // Writes are atomic (temp file + rename) and readers need no lock.
 #include <windows.h>
 
@@ -13,7 +13,7 @@
 namespace settings_file {
 
 inline constexpr const char* kSections[] = {"native", "xr",    "shape",     "monitor", "arms",   "hud",    "moveprobe",
-                                            "mounts", "pad",   "dlss",      "scanstereo", "skinik", "iktrace"};
+                                            "mounts", "pad",   "dlss",      "scanstereo", "skinik", "iktrace", "ik_tune", "hud_widgets", "fullview_fx", "tuner_prefs", "hud_groups", "lua_root", "lua_tunables"};
 inline constexpr const char kHeader[] =
     "; AvatarVR settings. The menu keeps this file up to date; edit by hand only while the game is closed.\r\n";
 
@@ -35,6 +35,10 @@ inline std::wstring dir_of(const std::wstring& path) {
 inline std::string section_of(const std::wstring& path) {
   const auto slash = path.find_last_of(L"\\/");
   const std::wstring leaf = slash == std::wstring::npos ? path : path.substr(slash + 1);
+  if (path.ends_with(L"\\avr\\root.txt")) return "lua_root";
+  if (path.ends_with(L"\\avr\\tunables.txt")) return "lua_tunables";
+  if (leaf == L"AvatarVR_tuner_prefs.json") return "tuner_prefs";
+  if (leaf == L"AvatarVR_hud_groups.json") return "hud_groups";
   constexpr std::wstring_view prefix = L"AvatarVR_", suffix = L".txt";
   if (leaf.size() <= prefix.size() + suffix.size() || leaf.compare(0, prefix.size(), prefix) != 0 ||
       leaf.compare(leaf.size() - suffix.size(), suffix.size(), suffix) != 0) {
@@ -46,6 +50,18 @@ inline std::string section_of(const std::wstring& path) {
     name += static_cast<char>(leaf[i]);
   }
   return is_section(name) ? name : std::string();
+}
+
+inline std::wstring section_dir(const std::wstring& path) {
+  const auto dir = dir_of(path);
+  return path.ends_with(L"\\avr\\root.txt") || path.ends_with(L"\\avr\\tunables.txt") ? dir_of(dir) : dir;
+}
+
+inline std::wstring legacy_leaf(std::string_view section) {
+  if (section == "lua_root") return L"avr\\root.txt";
+  if (section == "lua_tunables") return L"avr\\tunables.txt";
+  const auto suffix = section == "tuner_prefs" || section == "hud_groups" ? L".json" : L".txt";
+  return L"AvatarVR_" + std::wstring(section.begin(), section.end()) + suffix;
 }
 
 inline std::wstring store_path(const std::wstring& dir) { return dir + L"\\AvatarVR_settings.ini"; }
@@ -135,72 +151,106 @@ inline std::string with_section(std::string text, std::string_view section, std:
   return text;
 }
 
-inline SRWLOCK& write_lock() {
-  static SRWLOCK lock = SRWLOCK_INIT;
-  return lock;
-}
+class WriteLock {
+ public:
+  WriteLock() : handle_(CreateMutexW(nullptr, FALSE, L"Local\\AvatarVR.Settings")) {
+    if (handle_) {
+      const auto status = WaitForSingleObject(handle_, 2000);
+      acquired_ = status == WAIT_OBJECT_0 || status == WAIT_ABANDONED;
+    }
+  }
+  ~WriteLock() {
+    if (acquired_) ReleaseMutex(handle_);
+    if (handle_) CloseHandle(handle_);
+  }
+  WriteLock(const WriteLock&) = delete;
+  WriteLock& operator=(const WriteLock&) = delete;
+  explicit operator bool() const { return acquired_; }
+
+ private:
+  HANDLE handle_;
+  bool acquired_ = false;
+};
 
 }  // namespace detail
 
 // True when the path is one of the settings now kept in the shared file.
 inline bool owns(const std::wstring& path) { return !detail::section_of(path).empty(); }
 
-// Same contract as reading the old file into a zeroed buffer: false when it does not exist.
-inline bool read(const std::wstring& path, char* text, size_t size, DWORD* got = nullptr) {
-  text[0] = '\0';
-  if (got != nullptr) *got = 0;
+inline bool read(const std::wstring& path, std::string& value) {
   const std::string section = detail::section_of(path);
-  std::string all, value;
-  bool found = false;
-  if (!section.empty() && detail::read_all(detail::store_path(detail::dir_of(path)), all)) {
+  std::string all;
+  if (!section.empty() && detail::read_all(detail::store_path(detail::section_dir(path)), all)) {
     size_t begin = 0, body = 0, end = 0;
     if (detail::find_block(all, section, &begin, &body, &end)) {
-      value = all.substr(body, end - body);
-      found = true;
+      value.assign(all, body, end - body);
+      return true;
     }
   }
-  if (!found && !detail::read_all(path, value)) return false;  // not migrated yet, or dropped in by hand this session
+  return detail::read_all(path, value);
+}
+
+inline bool read(const std::wstring& path, char* text, size_t size, DWORD* got = nullptr) {
+  if (got) *got = 0;
+  if (!size) return false;
+  text[0] = '\0';
+  std::string value;
+  if (!read(path, value)) return false;
   const size_t n = value.size() < size - 1 ? value.size() : size - 1;
   std::memcpy(text, value.data(), n);
   text[n] = '\0';
-  if (got != nullptr) *got = static_cast<DWORD>(n);
+  if (got) *got = static_cast<DWORD>(n);
   return true;
 }
 
 inline bool write(const std::wstring& path, std::string_view value) {
   const std::string section = detail::section_of(path);
   if (section.empty()) return false;
-  const std::wstring store = detail::store_path(detail::dir_of(path));
-  AcquireSRWLockExclusive(&detail::write_lock());
+  const std::wstring store = detail::store_path(detail::section_dir(path));
+  const detail::WriteLock lock;
+  if (!lock) return false;
   std::string all;
-  detail::read_all(store, all);
+  if (!detail::read_all(store, all) && GetFileAttributesW(store.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
   const std::string next = detail::with_section(all, section, value);
   const bool ok = next == all || detail::replace_file(store, next);
-  ReleaseSRWLockExclusive(&detail::write_lock());
   return ok;
 }
 
 // At load, before any module reads settings: import every old file, then move it to settings_migrated\ as a backup.
 // A file placed by hand between launches therefore replaces its section once. Does nothing in a folder that has none.
 inline void migrate(const std::wstring& dir) {
+  const detail::WriteLock lock;
+  if (!lock) return;
   std::string all;
-  detail::read_all(detail::store_path(dir), all);
+  const auto store = detail::store_path(dir);
+  if (!detail::read_all(store, all) && GetFileAttributesW(store.c_str()) != INVALID_FILE_ATTRIBUTES) return;
   const std::string before = all;
-  std::wstring moved[sizeof(kSections) / sizeof(kSections[0])];
+  const char* moved[sizeof(kSections) / sizeof(kSections[0])]{};
   size_t count = 0;
   for (const char* s : kSections) {
-    const std::wstring old = dir + L"\\AvatarVR_" + std::wstring(s, s + std::strlen(s)) + L".txt";
+    const std::wstring old = dir + L"\\" + detail::legacy_leaf(s);
     std::string value;
     if (detail::read_all(old, value)) {
-      all = detail::with_section(all, s, value);
-      moved[count++] = std::wstring(s, s + std::strlen(s));
+      size_t begin = 0, body = 0, end = 0;
+      const auto legacy = std::string_view(s);
+      const bool manual_override = legacy == "native" || legacy == "xr" || legacy == "shape" || legacy == "monitor" ||
+                                   legacy == "arms" || legacy == "hud" || legacy == "moveprobe" || legacy == "mounts" ||
+                                   legacy == "pad" || legacy == "dlss" || legacy == "scanstereo" || legacy == "skinik" ||
+                                   legacy == "iktrace";
+      if (manual_override || !detail::find_block(all, s, &begin, &body, &end))
+        all = detail::with_section(all, s, value);
+      moved[count++] = s;
     }
   }
-  if (count == 0 || (all != before && !detail::replace_file(detail::store_path(dir), all))) return;
+  if (count == 0 || (all != before && !detail::replace_file(store, all))) return;
+  std::string persisted;
+  if (!detail::read_all(store, persisted) || persisted != all) return;
   const std::wstring backup = dir + L"\\settings_migrated";
   CreateDirectoryW(backup.c_str(), nullptr);
   for (size_t i = 0; i < count; ++i) {
-    const std::wstring leaf = L"\\AvatarVR_" + moved[i] + L".txt";
+    const std::string_view section = moved[i];
+    const std::wstring leaf = L"\\" + detail::legacy_leaf(section);
+    if (section == "lua_root" || section == "lua_tunables") CreateDirectoryW((backup + L"\\avr").c_str(), nullptr);
     MoveFileExW((dir + leaf).c_str(), (backup + leaf).c_str(), MOVEFILE_REPLACE_EXISTING);
   }
 }

@@ -5,6 +5,8 @@ F10 -> UI -> Native HUD on arm and Damage effect fills your view are on. Default
 The mod lists every full-size widget origin it has seen in AvatarVR_fullview_seen.txt. Effects are drawn on the scanner's
 head-forward plane, one surface for both eyes.
 """
+import io
+import settings_store
 import os
 import tkinter as tk
 from tkinter import ttk
@@ -25,7 +27,7 @@ def read_effects(path):
     """The saved list, or the default when there is none. Fields from older builds are ignored."""
     found = {}
     try:
-        with open(path, encoding="utf-8") as stream:
+        with io.StringIO(settings_store.read(path)) as stream:
             for line in stream:
                 name, _, value = line.strip().partition("=")
                 effect, _, field = name.partition(".")
@@ -56,7 +58,7 @@ def render(effects):
 class FullViewTab:
     def __init__(self, parent, root, scripts):
         self.root, self.path = root, os.path.join(scripts, FILE)
-        self.seen_path = os.path.join(scripts, SEEN_FILE)
+        self.seen_path = os.path.join(scripts, "AvatarVR", "state", SEEN_FILE)
         self.effects = read_effects(self.path)
         self.pending = None
         self.loading = False
@@ -164,10 +166,7 @@ class FullViewTab:
     def write(self):
         self.pending = None
         try:
-            temporary = self.path + ".tmp"
-            with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-                stream.write(render(self.effects))
-            os.replace(temporary, self.path)
+            settings_store.write(self.path, render(self.effects))
             self.status.set("Saved " + self.path)
         except OSError as error:
             self.status.set("Could not save: %s" % error)

@@ -1,9 +1,11 @@
+#include "../runtime_log.hpp"
 #include "virtual_pad.hpp"
 #include "vr_controls.hpp"
 #include "../diagnostics/skin_palette_probe.hpp"
 #include "../diagnostics/move_probe.hpp"
 
 #include "xr_input.hpp"
+#include "vr_recoil.hpp"
 #include "menu_pointer.hpp"
 #include "pitch_level.hpp"
 #include "../camera/native_stereo.hpp"
@@ -71,14 +73,7 @@ void write_line(const char* text) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, text, static_cast<DWORD>(std::strlen(text)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {text, "\r\n"});
 }
 
 void logf(const char* fmt, ...) {
@@ -264,6 +259,7 @@ DWORD WINAPI set_state_detour(DWORD user, XINPUT_VIBRATION* vibration) {
   }
   if (g_mode == Mode::kXr && vibration != nullptr) {
     xr_input::rumble(vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);
+    vr_recoil::note_rumble(vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);  // shot-signal candidate
     g_set_state_original[I](0, vibration);  // a real pad on slot 0 rumbles too
   }
   return ERROR_SUCCESS;
@@ -360,7 +356,6 @@ void install() {
     return;
   }
   g_log_path = dir + L"\\VIRTUAL_PAD.log";
-  MoveFileExW(g_log_path.c_str(), (dir + L"\\VIRTUAL_PAD.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   g_mode = read_mode(dir);
   logf("virtual pad build %s %s pid=%lu mode=%s (scripts\\AvatarVR_pad.txt: off|test|xr)", __DATE__, __TIME__,
        GetCurrentProcessId(), mode_name(g_mode));

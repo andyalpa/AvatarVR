@@ -9,6 +9,7 @@ void on_present();
 bool shot_aim(float* origin,float* forward,float* distance);
 bool shot_distance(float* distance);  // mounted: how far the gun's ray runs (the ray itself is in HudCameraPose)
 bool shot_ray_on();  // shots are moved onto the gun, so an aim ray is expected
+bool held_is_bow();  // the current weapon has shown a drawn arrow (bows get no recoil kick)
 // Menu "Shoot from tracked gun": shots and aim leave the IK gun. On by default.
 bool* shoot_from_tracked_flag();
 // Menu "Weapon follows tracked gun": the game places its weapon entity at the IK hand (0x141859AD0 hook). On by default.

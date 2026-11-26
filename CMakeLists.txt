@@ -89,6 +89,10 @@ add_library(AvatarVR SHARED
   src/diagnostics/pose_phase_probe.cpp
   src/diagnostics/move_probe.cpp
   src/vr/vr_weapon.cpp
+  src/vr/vr_recoil.cpp
+  src/vr/bow_draw.cpp
+  src/vr/reload_probe.cpp
+  src/vr/manual_reload.cpp
   src/vr/vr_arms.cpp
   src/vr/vr_controls.cpp
   src/vr/hand_gestures.cpp
@@ -128,8 +132,11 @@ add_executable(ui_layout_test tools/tests/ui_layout_test.cpp)
 add_executable(skin_palette_pulse_test tools/tests/skin_palette_pulse_test.cpp)
 add_executable(skin_arm_ik_test tools/tests/skin_arm_ik_test.cpp)
 add_executable(vr_weapon_test tools/tests/vr_weapon_test.cpp)
+add_executable(vr_recoil_test tools/tests/vr_recoil_test.cpp)
 add_executable(vr_arms_test tools/tests/vr_arms_test.cpp)
 add_executable(vr_controls_test tools/tests/vr_controls_test.cpp)
+add_executable(bow_draw_test tools/tests/bow_draw_test.cpp)
+add_executable(manual_reload_test tools/tests/manual_reload_test.cpp)
 add_executable(hand_gestures_test tools/tests/hand_gestures_test.cpp)
 add_executable(xr_input_gestures_test tools/tests/xr_input_gestures_test.cpp)
 target_include_directories(xr_input_gestures_test PRIVATE third_party/openxr-sdk/include)
@@ -143,3 +150,32 @@ target_compile_definitions(load_proof_host PRIVATE UNICODE _UNICODE WIN32_LEAN_A
 if(MSVC)
   target_compile_options(load_proof_host PRIVATE /W4 /EHsc)
 endif()
+
+# Only self-contained checks belong in the default test suite.
+enable_testing()
+add_test(NAME load_proof COMMAND load_proof_host)
+foreach(test_target IN ITEMS
+    settings_file_test
+    lens_projection_test
+    ui_canvas_test
+    ui_cursor_test
+    menu_pointer_test
+    menu_transition_test
+    xr_depth_test
+    frame_gen_test
+    ui_layout_test
+    skin_palette_pulse_test
+    skin_arm_ik_test
+    vr_weapon_test
+    vr_recoil_test
+    vr_arms_test
+    vr_controls_test
+    bow_draw_test
+    manual_reload_test
+    hand_gestures_test
+    xr_input_gestures_test
+    mount_camera_capture_test
+    mount_anchor_test
+    rider_ik_test)
+  add_test(NAME ${test_target} COMMAND ${test_target})
+endforeach()

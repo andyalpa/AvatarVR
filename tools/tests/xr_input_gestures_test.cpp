@@ -101,7 +101,9 @@ int main() {
   fake::tracking=false; xr_input::sync(session); locate(); check(xr_input::sensors(&input) && !input.hand[0].tracked,"tracking loss visible to policy");
   fake::tracking=true; fake::focused=false; xr_input::sync(session); check(!xr_input::sensors(&input),"focus loss invalidates immediately");
   fake::focused=true; xr_input::set_menu_open(true); xr_input::sync(session); locate();
-  check(!xr_input::sensors(&input) && xr_input::controls(&raw) && raw.lt==.7f,"menu blocks gestures while raw pad remains available");
+  check(xr_input::sensors(&input) && input.hand[0].tracked && !input.hand[0].grip.active && !input.hand[0].index_touch.active &&
+        !input.hand[1].thumb_touch.active && xr_input::controls(&raw) && raw.lt==.7f,
+        "menu: gestures stay on (Hands tab preview) with neutral controls; raw pad remains available");
   xr_input::set_menu_open(false); xr_input::sync(session); locate(); Sleep(270);
   check(!xr_input::sensors(&input),"stale sensor frame rejected");
   xr_input::destroy(); check(!xr_input::sensors(&input),"session destroy clears frame");

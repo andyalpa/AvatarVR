@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "frame_capture.hpp"
 
 #include "../camera/camera.hpp"
@@ -55,14 +56,7 @@ void log_line(const char* fmt, ...) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, buffer, static_cast<DWORD>(std::strlen(buffer)), &written, nullptr);
-  WriteFile(file, "\r\n", 2, &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {buffer, "\r\n"});
 }
 
 std::wstring self_dir() {
@@ -283,7 +277,7 @@ void capture_panel() {
   GetLocalTime(&t);
   wchar_t stamp[32];
   swprintf(stamp, 32, L"%04u%02u%02u_%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-  const std::wstring folder = g_dir + L"\\captures";
+  const std::wstring folder = g_dir + L"\\AvatarVR\\captures";
   CreateDirectoryW(folder.c_str(), nullptr);
   const std::wstring base = folder + L"\\panel_" + stamp;
   const bool saved = write_bmp(base + L".bmp", over.data(), w, h, w * 4, false) &&
@@ -383,7 +377,7 @@ void capture(IDXGISwapChain* swapchain, const std::string& tag) {
     log_line("capture %s: Map failed", tag.c_str());
     return;
   }
-  const std::wstring folder = g_dir + L"\\captures";
+  const std::wstring folder = g_dir + L"\\AvatarVR\\captures";
   CreateDirectoryW(folder.c_str(), nullptr);
   const std::wstring path = folder + L"\\cap_" + std::wstring(tag.begin(), tag.end()) + L".bmp";
   const bool saved = write_bmp(path, static_cast<const unsigned char*>(mapped) + footprint.Offset,
@@ -658,7 +652,7 @@ void capture_eyes(IDXGISwapChain* swapchain, Grab* grab = nullptr, int burst_ind
       wchar_t burst[40] = {};
       if (burst_index >= 0) swprintf(burst, 40, L"_mvburst_%llu_f%d", burst_id, burst_index);
       swprintf(dname, 96, L"\\eyes_%04u%02u%02u_%02u%02u%02u%s_diff.jpg", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, burst);
-      const std::wstring folder = g_dir + L"\\captures";
+      const std::wstring folder = g_dir + L"\\AvatarVR\\captures";
       CreateDirectoryW(folder.c_str(), nullptr);
       std::thread(save_jpeg, folder + dname, std::move(diff), w, h).detach();
     }
@@ -673,7 +667,7 @@ void capture_eyes(IDXGISwapChain* swapchain, Grab* grab = nullptr, int burst_ind
       ui.clear();
     }
   }
-  const std::wstring folder = g_dir + L"\\captures";
+  const std::wstring folder = g_dir + L"\\AvatarVR\\captures";
   CreateDirectoryW(folder.c_str(), nullptr);
   SYSTEMTIME t;
   GetLocalTime(&t);
@@ -681,8 +675,9 @@ void capture_eyes(IDXGISwapChain* swapchain, Grab* grab = nullptr, int burst_ind
   wchar_t burst[40] = {};
   if (burst_index >= 0) swprintf(burst, 40, L"_mvburst_%llu_f%d", burst_id, burst_index);
   swprintf(name, 96, L"\\eyes_%04u%02u%02u_%02u%02u%02u%s%s.jpg", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
-           burst, right != nullptr ? L"" : L"_leftonly");
-  log_line("eyes: copied %ux%u %s; encoding", w, h, right != nullptr ? "left | right" : "left only (no right image)");
+           burst, right == nullptr ? L"_leftonly" : L"");
+  log_line("eyes: copied %ux%u %s; encoding", w, h,
+           right == nullptr ? "left only (no right image)" : "left | right");
   std::thread(save_jpeg, folder + name, std::move(image), out_w, h).detach();
   if (!ui.empty()) {
     std::wstring ui_name = name;
@@ -884,7 +879,7 @@ void sweep_present(IDXGISwapChain* swapchain) {
     SYSTEMTIME t;
     GetLocalTime(&t);
     wchar_t step_name[96];
-    swprintf(step_name, 96, L"\\captures\\sweepstep_%d_%02d_%02u%02u%02u.jpg", g_sweep_mode, g_sweep_step, t.wHour, t.wMinute,
+    swprintf(step_name, 96, L"\\AvatarVR\\captures\\sweepstep_%d_%02d_%02u%02u%02u.jpg", g_sweep_mode, g_sweep_step, t.wHour, t.wMinute,
              t.wSecond);
     std::thread(save_jpeg, g_dir + step_name, g.pair, g.w * 2, g.h).detach();
   }
@@ -941,7 +936,7 @@ void sweep_present(IDXGISwapChain* swapchain) {
                                                   : "no slot halves the mismatch");
   }
   end_sweep();
-  const std::wstring folder = g_dir + L"\\captures";
+  const std::wstring folder = g_dir + L"\\AvatarVR\\captures";
   CreateDirectoryW(folder.c_str(), nullptr);
   SYSTEMTIME t;
   GetLocalTime(&t);
@@ -967,7 +962,6 @@ void install() {
   }
   g_trigger_path = g_dir + L"\\AvatarVR_capture.txt";
   g_log_path = g_dir + L"\\CAPTURE.log";
-  MoveFileExW(g_log_path.c_str(), (g_dir + L"\\CAPTURE.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   log_line("frame capture build %s %s pid=%lu trigger=AvatarVR_capture.txt", __DATE__, __TIME__, GetCurrentProcessId());
 }
 

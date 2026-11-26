@@ -146,12 +146,14 @@ inline bool reference_from_text(const std::string& text,HandReference& ref) {
   ref=std::move(next);return true;
 }
 // Same mesh proportions? Animation does not stretch finger segments, another mesh does.
-inline bool reference_fits(const HandReference& ref,const float (*mats)[16],unsigned n) {
+// Largest relative finger-segment length difference between a saved reference and the live hand (1e9 if unusable).
+inline float reference_fit_error(const HandReference& ref,const float (*mats)[16],unsigned n) {
   using namespace skin_arm_ik;
   float palm[16],inverse[16];
-  if(!ref.valid || ref.local.size()!=n) return false;
+  if(!ref.valid || ref.local.size()!=n) return 1e9f;
   multiply_affine(palm,ref.palm_in_wrist,mats[ref.wrist]);
-  if(!inverse_affine(inverse,palm)) return false;
+  if(!inverse_affine(inverse,palm)) return 1e9f;
+  float worst=0.f;
   for(int k=0;k<mounted_hand_pose::count;++k) {
     const int p=mounted_hand_pose::parent[k];if(p<0) continue;
     const float saved=length(sub(position(ref.local[ref.core[k]].data()),position(ref.local[ref.core[p]].data())));
@@ -159,9 +161,21 @@ inline bool reference_fits(const HandReference& ref,const float (*mats)[16],unsi
     float a[16],b[16];
     multiply_affine(a,mats[ref.core[k]],inverse);multiply_affine(b,mats[ref.core[p]],inverse);
     const float live=length(sub(position(a),position(b)));
-    if(!(live>saved*.85f && live<saved*1.15f)) return false;
+    const float e=std::fabs(live/saved-1.f);
+    if(!std::isfinite(e)) return 1e9f;
+    worst=std::max(worst,e);
   }
-  return true;
+  return worst;
+}
+inline bool reference_fits(const HandReference& ref,const float (*mats)[16],unsigned n) {return reference_fit_error(ref,mats,n)<.15f;}
+// [AUTHOR 2026-11-18] tuned fingers looked different after some restarts. [STATIC] AvatarVR_hand_references.txt held two entries
+// per rig and hand whose finger frames differ by a median 13 deg (up to 55) and whose segment lengths differ by up to 11%, so the
+// old "first entry within 15%" rule could pick either one on a given load. The FIRST saved entry is now kept whenever it is
+// plausibly the same mesh (within 25%); a later entry is used only if the first is not. Tunes are authored against it.
+constexpr float kSavedReferenceTolerance=.25f;
+inline int choose_saved_reference(const float* errors,int count) {
+  for(int i=0;i<count;++i) if(errors[i]<kSavedReferenceTolerance) return i;
+  return -1;
 }
 inline void euler_adjust(float x,float y,float z,float* out) {
   float a[16],b[16],c[16],ab[16];

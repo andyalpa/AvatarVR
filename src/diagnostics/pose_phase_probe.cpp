@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "pose_phase_probe.hpp"
 #include "../game/player.hpp"
 #include <windows.h>
@@ -36,9 +37,7 @@ Pose pose(const unsigned char* comp,unsigned offset,unsigned expected,unsigned w
  return result;
 }
 void log(const char* text) {
- HANDLE file=CreateFileW((dir+L"\\POSE_PHASE_PROBE.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,OPEN_ALWAYS,0,nullptr);
- if(file==INVALID_HANDLE_VALUE)return;
- DWORD n;WriteFile(file,text,static_cast<DWORD>(std::strlen(text)),&n,nullptr);WriteFile(file,"\r\n",2,&n,nullptr);CloseHandle(file);
+ runtime_log::append(dir+L"\\POSE_PHASE_PROBE.log", {text, "\r\n"});
 }
 }
 namespace pose_phase_probe {

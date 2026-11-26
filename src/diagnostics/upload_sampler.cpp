@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "upload_sampler.hpp"
 
 #include "resource_names.hpp"
@@ -290,13 +291,7 @@ void write_raw(const std::string& text) {
   if (g_log_path.empty() || text.empty()) {
     return;
   }
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {text});
 }
 
 void log_line(const std::string& text) {
@@ -333,14 +328,6 @@ void logf(const char* fmt, ...) {
   va_end(args);
   buffer[sizeof(buffer) - 1] = '\0';
   log_line(buffer);
-}
-
-void rotate_log() {
-  if (g_log_path.empty() || GetFileAttributesW(g_log_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    return;
-  }
-  const std::wstring previous = parent_dir(g_log_path) + L"\\UPLOAD_OBSERVE.prev.log";
-  MoveFileExW(g_log_path.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 void* vtable_slot(void* object, int index) {
@@ -1067,7 +1054,6 @@ void install() {
     return;
   }
   g_log_path = parent_dir(module_path(self)) + L"\\UPLOAD_OBSERVE.log";
-  rotate_log();
   eye_write::install();
   logf("upload observer build %s %s modest_worker=%s cbv_table_every=%d field_dump_every=%d field_dump_max=%d dump_copies=%d gameplay_tmag_min=%.0f",
        __DATE__, __TIME__, kEnableModestWorker ? "on" : "off", kCbvTableEvery, kFieldDumpEvery, kFieldDumpMax, kDumpCopies, kGameplayTmagMin);

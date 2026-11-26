@@ -1,3 +1,4 @@
+#include "runtime_log.hpp"
 #include <windows.h>
 
 #include <string>
@@ -51,12 +52,12 @@ std::string wide_to_utf8(const std::wstring& text) {
 }
 
 std::string read_file(const std::wstring& path) {
-  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE) {
     return {};
   }
   LARGE_INTEGER size{};
-  if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024) {
+  if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 32 * 1024 * 1024) {
     CloseHandle(file);
     return {};
   }
@@ -76,7 +77,7 @@ std::string read_file(const std::wstring& path) {
 int wmain() {
   const std::wstring host_path = module_path(nullptr);
   const std::wstring dll_path = join_path(parent_dir(host_path), L"AvatarVR.dll");
-  const std::wstring log_path = join_path(parent_dir(dll_path), L"LOAD_PROOF.log");
+  const std::wstring log_path = join_path(parent_dir(dll_path), runtime_log::kFile);
 
   HMODULE loaded = LoadLibraryW(dll_path.c_str());
   if (loaded == nullptr) {
@@ -85,10 +86,12 @@ int wmain() {
     return 1;
   }
 
+  const auto complete = "detail_complete pid=" + std::to_string(GetCurrentProcessId()) + "\r\n";
+  const auto failed = "detail_error thread pid=" + std::to_string(GetCurrentProcessId()) + "\r\n";
   std::string log;
   for (int attempt = 0; attempt < 200; ++attempt) {
     log = read_file(log_path);
-    if (log.find("detail_complete") != std::string::npos || log.find("detail_error") != std::string::npos) {
+    if (log.find(complete) != std::string::npos || log.find(failed) != std::string::npos) {
       break;
     }
     Sleep(50);
@@ -97,7 +100,7 @@ int wmain() {
   const std::string host_utf8 = wide_to_utf8(host_path);
   const bool canary = log.find("CANARY Hello from AvatarVR") != std::string::npos;
   const bool host_named = !host_utf8.empty() && log.find(host_utf8) != std::string::npos;
-  const bool finished = log.find("detail_complete") != std::string::npos;
+  const bool finished = log.find(complete) != std::string::npos;
   fwrite(log.data(), 1, log.size(), stdout);
   if (!canary || !host_named || !finished) {
     fwprintf(stderr, L"load proof failed canary=%d host=%d finished=%d\n", canary ? 1 : 0, host_named ? 1 : 0, finished ? 1 : 0);

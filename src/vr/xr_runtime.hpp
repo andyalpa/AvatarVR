@@ -36,9 +36,7 @@ ID3D12CommandQueue* acquire_game_queue();
 bool session_running();  // an XR session is in its frame loop
 // The runtime's recommended per-eye image size (view 0); false before the system has been queried.
 bool recommended_size(uint32_t* w, uint32_t* h);
-// Live one-line state of a frame-generation OpenXR layer in this process (OFXR-Bridge, VectorXR): which one is
-// loaded, and from its status.json (when that tool exports one) whether it generates and at what rates. For the mod
-// menu's Headset tab; refreshed once a second on the Present thread. 2026-11-12.
+// Live status of AvatarVR frame generation.
 const char* framegen_status();
 // Headset display period in milliseconds from the last xrWaitFrame (0 = no live session).
 double display_period_ms();

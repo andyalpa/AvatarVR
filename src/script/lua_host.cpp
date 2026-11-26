@@ -1,3 +1,6 @@
+#include "../runtime_log.hpp"
+#include <sstream>
+#include "../settings_file.hpp"
 #include "lua_host.hpp"
 
 #include "../camera/native_stereo.hpp"
@@ -105,19 +108,11 @@ void write_line(const char* text) {
   if (g_log_path.empty()) {
     return;
   }
-  HANDLE f = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (f == INVALID_HANDLE_VALUE) {
-    return;
-  }
   SYSTEMTIME st;
   GetLocalTime(&st);
   char stamp[32];
-  const int n = snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-  DWORD w = 0;
-  WriteFile(f, stamp, static_cast<DWORD>(n), &w, nullptr);
-  WriteFile(f, text, static_cast<DWORD>(std::strlen(text)), &w, nullptr);
-  WriteFile(f, "\r\n", 2, &w, nullptr);
-  CloseHandle(f);
+  snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+  runtime_log::append(g_log_path, {stamp, text, "\r\n"});
 }
 
 void logf(const char* fmt, ...) {
@@ -163,20 +158,14 @@ std::wstring module_dir() {
 std::wstring tunables_path() { return g_dir + L"\\avr\\tunables.txt"; }
 
 void load_saved() {
-  FILE* f = _wfopen(tunables_path().c_str(), L"rb");
-  if (f == nullptr) {
-    return;
+  std::string text;
+  if (!settings_file::read(tunables_path(), text)) return;
+  std::istringstream input(text);
+  for (std::string line; std::getline(input, line);) {
+    const auto eq = line.find('=');
+    if (eq != std::string::npos)
+      g_saved[line.substr(0, eq)] = static_cast<float>(std::atof(line.c_str() + eq + 1));
   }
-  char line[160];
-  while (fgets(line, sizeof(line), f) != nullptr) {
-    char* eq = std::strchr(line, '=');
-    if (eq == nullptr) {
-      continue;
-    }
-    *eq = '\0';
-    g_saved[line] = static_cast<float>(std::atof(eq + 1));
-  }
-  fclose(f);
 }
 
 // Called once a second: menu edits land in g_tunables; keep g_saved and the file in step.
@@ -195,12 +184,7 @@ void save_tunables() {
   if (text == g_saved_text) {
     return;
   }
-  g_saved_text = text;
-  FILE* f = _wfopen(tunables_path().c_str(), L"wb");
-  if (f != nullptr) {
-    fwrite(text.data(), 1, text.size(), f);
-    fclose(f);
-  }
+  if (settings_file::write(tunables_path(), text)) g_saved_text = text;
 }
 
 lua_host::Tunable* find_tunable(const char* name, bool create) {
@@ -1040,7 +1024,6 @@ void install() {
     return;
   }
   g_log_path = g_dir + L"\\SCRIPTS.log";
-  MoveFileExW(g_log_path.c_str(), (g_dir + L"\\SCRIPTS.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
   CreateDirectoryW((g_dir + L"\\avr").c_str(), nullptr);
   CreateDirectoryW((g_dir + L"\\avr\\autorun").c_str(), nullptr);
   CreateDirectoryW((g_dir + L"\\avr\\lib").c_str(), nullptr);
@@ -1048,20 +1031,14 @@ void install() {
        __TIME__, LUA_RELEASE);
   // scripts\avr\root.txt may name another script root (e.g. the repo's lua\ folder, so edits stay versioned).
   g_root = g_dir + L"\\avr";
-  if (FILE* f = _wfopen((g_root + L"\\root.txt").c_str(), L"rb")) {
-    char line[MAX_PATH] = {};
-    if (fgets(line, sizeof(line), f) != nullptr) {
-      std::string r(line);
-      while (!r.empty() && (r.back() == '\n' || r.back() == '\r' || r.back() == ' ' || r.back() == '\\')) {
-        r.pop_back();
-      }
-      wchar_t w[MAX_PATH] = {};
-      if (!r.empty() && MultiByteToWideChar(CP_UTF8, 0, r.c_str(), -1, w, MAX_PATH) > 0 &&
-          GetFileAttributesW(w) != INVALID_FILE_ATTRIBUTES) {
-        g_root = w;
-      }
-    }
-    fclose(f);
+  std::string root_setting;
+  if (settings_file::read(g_root + L"\\root.txt", root_setting)) {
+    const auto newline = root_setting.find_first_of("\r\n");
+    std::string root = root_setting.substr(0, newline);
+    while (!root.empty() && (root.back() == ' ' || root.back() == '\\')) root.pop_back();
+    wchar_t path[MAX_PATH] = {};
+    if (!root.empty() && MultiByteToWideChar(CP_UTF8, 0, root.c_str(), -1, path, MAX_PATH) > 0 &&
+        GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) g_root = path;
   }
   logf("script root %s", narrow(g_root).c_str());
   load_saved();

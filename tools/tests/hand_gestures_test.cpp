@@ -1,6 +1,9 @@
 #include "../../src/vr/hand_gesture_pose.hpp"
 #include "../../src/vr/hand_gesture_bindings.hpp"
 #include "../../src/vr/hand_gesture_context_audit.hpp"
+#include "../../src/vr/gesture_tune_edit.hpp"
+#include "../../src/ui/tuner_model.hpp"
+#include "../../src/diagnostics/rider_ik.hpp"
 #include <map>
 #include <cstdio>
 #include <limits>
@@ -536,6 +539,84 @@ void context_audit_tests() {
   check(!native.equipment_readable,"malformed equipment flag rejected");
 }
 }
+void menu_edit_tests() {
+  // The in-VR Hands tab must read/write exactly what the runtime parses and keep every other tool's keys.
+  gesture_edit::File f;
+  f.parse("# header\r\ntp.left.forearm_roll=-10\r\nhud.size=0.12\r\ngesture.fp.right.fist.index.roll3=-24.9326\r\nbad line\r\n");
+  check(f.values.size()==3,"menu: numeric lines kept, comments and junk dropped");
+  check(close(f.get(0,1,11,1,14),-24.9326f,1e-4f),"menu: stored fine value read back (index roll3)");
+  check(close(f.get(0,0,11,1,6),default_shape(11).finger[1].bend[0]),"menu: absent key reads the runtime default");
+  f.set(0,0,7,2,6,33.f); f.set(0,0,7,2,6,default_shape(7).finger[2].bend[0]);
+  check(!f.values.count("gesture.fp.left.point.middle.bend1"),"menu: value equal to default is removed");
+  f.set(0,0,7,1,0,500.f); check(close(f.get(0,0,7,1,0),90.f),"menu: root pitch clamped like tune_key");
+  f.set(0,0,7,1,3,7.5f);
+  const Tuning t=parse_gesture_tune(f.text());
+  check(close(t.poses[0][1][11].finger[1].extra[11],-24.9326f,1e-4f) && close(t.poses[0][0][7].finger[1].extra[0],90.f) &&
+        close(t.poses[0][0][7].finger[1].extra[3],7.5f),"menu: written file parses to the same pose in the runtime");
+  const std::string text=f.text();
+  check(text.find("tp.left.forearm_roll=-10")!=std::string::npos && text.find("hud.size=0.12")!=std::string::npos &&
+        text.find("tp.left")<text.find("gesture."),"menu: other tools' keys kept, before gesture keys");
+  f.copy_pose(0,1,11,0,0);
+  check(close(f.get(0,0,11,1,14),-24.9326f,1e-4f),"menu: copy pose to the other hand");
+  f.reset_pose(0,1,11); check(close(f.get(0,1,11,1,14),0.f),"menu: reset pose returns to defaults");
+  check(close(f.get(0,0,11,1,14),-24.9326f,1e-4f),"menu: reset leaves the other hand");
+  f.preview(true,0,1,7,123.); const Tuning p=parse_gesture_tune(f.text());
+  check(p.preview_hand==1 && p.preview_combo==7 && p.preview_context==0 && p.preview_until==123.,"menu: preview keys parse");
+  for(int a=0;a<gesture_edit::axis_count;++a) {
+    float lo,hi,step;gesture_edit::axis_range(a,lo,hi,step);
+    Tuning one;check(tune_key(one,gesture_edit::key(1,0,3,0,a),hi+1000.),"menu: every axis key is a runtime key");
+  }
+}
+void tuner_page_tests() {
+  using namespace tuner_model;
+  // Mounted arms: every key the page writes is a key rider_ik parses, with the same limits.
+  std::string text;
+  // rider_ik rejects (does not clamp) out-of-range values, so the page's limits must be the parser's: write each limit.
+  for(const auto& s:shared_arm_specs()) text+=s.key+"="+(s.key=="tp.mount_correction"?std::string("1"):std::to_string(s.hi))+"\n";
+  for(int side=0;side<2;++side) for(const auto& s:side_arm_specs(side)) text+=s.key+"="+std::to_string(s.lo)+"\n";
+  check(shared_arm_specs().size()==18 && side_arm_specs(0).size()==19 && side_arm_specs(1)[0].key=="tp.right.hand_pitch","arms: tuner key lists");
+  rider_ik::Tune base;const auto t=rider_ik::parse_tune(text.c_str(),base.hand);
+  check(close(t.hand.pitch,180.f) && close(t.hand.palm,1.5f) && close(t.twist_upper,1.f) && close(t.adjust[0].hand.palm,-1.5f) &&
+        close(t.adjust[1].forearm_roll,-180.f) && close(t.adjust[1].twist_fore,-1.5f),"arms: page keys and limits match rider_ik");
+  const auto arms=settings_section("[xr]\nhand_pitch 5\n[arms]\narm_ik 1\nhand_pitch -65.0000\nhand_yaw x\n[view]\nhand_roll 3\n","arms");
+  check(arms.size()==2 && arms.at("hand_pitch")==-65. && !arms.count("hand_roll"),"arms: [arms] section values only");
+  // HUD: round trip, group moves, head start, reset.
+  Hud hud;hud.parse("health.attach=1\nhealth.along=0.115\nammo.lift=0.03\nsettings.frame=2\nbogus.along=4\n");
+  check(close(hud.v[0][HAlong],.115f) && close(hud.v[4][HLift],.03f) && hud.frame==2 && close(hud.v[14][HShrink],.5f),"hud: parse with defaults");
+  Hud again;again.parse(hud.text());check(again.text()==hud.text(),"hud: text round trip");
+  hud.set({0,1},0,HAlong,.215f);check(close(hud.v[0][HAlong],.215f) && close(hud.v[1][HAlong],.22f),"hud: group moves by the same amount");
+  hud.set({0,1},0,HScale,2.f);check(close(hud.v[1][HScale],2.f),"hud: group size scales");
+  hud.attach({0},0,kHudHeadAttach);check(close(hud.v[0][HAlong],.3f) && close(hud.v[0][HAttach],8.f),"hud: head attach starts 30 cm out");
+  hud.reset({0});check(close(hud.v[0][HAlong],.12f),"hud: reset to defaults");
+  const auto groups=hud_groups("{\"Bottom HUD (health, energy, prompts)\": [\"health\"], \"Mine\": [\"ammo\", \"nope\", \"status\"]}");
+  check(groups.size()==2 && groups[0].second.size()==1 && groups[1].first=="Mine" && groups[1].second==std::vector<int>({4,5}),"hud: groups json");
+  check(bone_list("0=Marker\n12=L_hand\nbad\n").size()==2,"hud: bone list");
+  // Effects: default when empty, round trip, seen list.
+  check(parse_effects("").size()==1 && close(parse_effects("")[0].size,1.02f),"fx: empty file means the default effect");
+  std::vector<Effect> fx(2);fx[1].x=280;fx[1].on=0;
+  const auto back=parse_effects(effects_text(fx));
+  check(back.size()==2 && back[1].x==280 && back[1].on==0,"fx: text round trip");
+  check(seen_widgets("0,0\n-64,-36\nx\n").size()==2,"fx: seen list");
+  // Capture reply and live status.
+  Capture c;
+  check(parse_capture("{\"id\":293413427,\"at\":1.5,\"hand\":\"left\",\"context\":\"fp\",\"position_mm\":48.864,\"angle_deg\":4.400,\"clamped\":2,\"values\":{\"thumb.bend1\":12.4446,\"thumb_01_expand01.pitch\":-3}}",c) &&
+        c.id==293413427 && !c.mounted && c.values.size()==2 && c.clamped==2,"capture: reply parsed");
+  int b=0,a=0;
+  check(gesture_edit::bone_axis_of("thumb_01_expand01.pitch",b,a) && b==4 && a==0 && gesture_edit::bone_axis_of("index.roll3",b,a) && b==1 && a==14,
+        "capture: bone.axis names map to editor bones");
+  gesture_edit::File f;f.set_bone(0,0,11,4,0,500.f);
+  const Tuning tt=parse_gesture_tune(f.text());
+  check(close(tt.poses[0][0][11].helper[0][0],90.f),"helpers: written helper value parses (clamped like tune_key)");
+  double pair[2]={},n=0;
+  check(json_pair("{\"owners\":[1,2],\"at\":17.5}","owners",pair) && pair[1]==2 && json_number("{\"owners\":[1,2],\"at\":17.5}","at",n) && n==17.5,"status: json fields");
+}
+void saved_reference_choice_tests() {
+  // [STATIC 2026-11-18] two saved entries per rig, lengths up to 11% apart: the first must win whenever it is plausible.
+  const float flaky[2]={.18f,.02f},far_first[2]={.40f,.05f},none[2]={.30f,.26f},one[1]={.0f};
+  check(choose_saved_reference(flaky,2)==0,"saved reference: first entry kept when its fit is only a little off (old rule took the second)");
+  check(choose_saved_reference(far_first,2)==1,"saved reference: another mesh's first entry falls through to the fitting one");
+  check(choose_saved_reference(none,2)==-1 && choose_saved_reference(one,1)==0 && choose_saved_reference(one,0)==-1,"saved reference: none / single / empty");
+}
 int main(int argc,char** argv) {
   if(argc==2 && !std::strcmp(argv[1],"--defaults")) {
     for(int c=0;c<combination_count;++c) {
@@ -554,5 +635,5 @@ int main(int argc,char** argv) {
     for(const auto& b:sensor_bindings(argv[2])) std::printf("%d %s\n",b.id,b.path.c_str());
     return 0;
   }
-  policy_tests(); pose_tests(); stable_gesture_tests(); thumb_control_tests(); persistent_reference_tests(); curl_path_tests(); weapon_free_hand_tests(); moving_tests(); capture_tests(); context_audit_tests(); if(failures) return 1; std::puts("hand_gestures_test passed"); return 0;
+  policy_tests(); pose_tests(); stable_gesture_tests(); thumb_control_tests(); persistent_reference_tests(); curl_path_tests(); weapon_free_hand_tests(); moving_tests(); capture_tests(); context_audit_tests(); menu_edit_tests(); tuner_page_tests(); saved_reference_choice_tests(); if(failures) return 1; std::puts("hand_gestures_test passed"); return 0;
 }

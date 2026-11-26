@@ -1,3 +1,4 @@
+#include "../runtime_log.hpp"
 #include "vr_menu.hpp"
 
 #include "../camera/native_stereo.hpp"
@@ -11,7 +12,12 @@
 #include "../script/lua_host.hpp"
 #include "../vr/vr_weapon.hpp"
 #include "../vr/vr_controls.hpp"
+#include "../vr/vr_recoil.hpp"
+#include "../vr/bow_draw.hpp"
+#include "../vr/manual_reload.hpp"
 #include "../vr/hand_gestures.hpp"
+#include "../vr/gesture_tune_edit.hpp"
+#include "tuner_model.hpp"
 #include "../vr/dlss_twin.hpp"
 #include "../diagnostics/skin_palette_probe.hpp"
 #include "../diagnostics/move_probe.hpp"
@@ -65,13 +71,7 @@ void log_line(const char* fmt, ...) {
   GetLocalTime(&t);
   char line[600];
   const int n = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u %s\r\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, buffer);
-  HANDLE file = CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    return;
-  }
-  DWORD written = 0;
-  WriteFile(file, line, static_cast<DWORD>(n > 0 && n < static_cast<int>(sizeof(line)) ? n : 0), &written, nullptr);
-  CloseHandle(file);
+  runtime_log::append(g_log_path, {std::string_view(line, n > 0 && n < static_cast<int>(sizeof(line)) ? n : 0)});
 }
 
 std::wstring module_dir() {
@@ -122,9 +122,6 @@ struct Settings {
   bool lodtexgame = true;  // "lodtexgame": with the detail fix, texture streaming keeps the game's own value (performance)
   float lodkeep = 0.f;     // "lodkeep N": glow test, one detail consumer group back on the original value
   float lodref = 0.f;      // "lodref D": reference FOV for detail, degrees (0 = the game's own FOV)
-  bool shadowunion = false; // "shadowunion": both eyes choose the same shadow-casting lights (ISSUE-04)
-  bool flatfollow = false; // "flatfollow": test, the flat game camera turns with the headset (ISSUE-04)
-  bool shadowfix = false;  // "shadowfix": each eye resolves sun shadows from its own shadow history (ISSUE-04)
   bool symproj = false;    // "symproj": test, each eye renders an on-axis frustum covering its window (ISSUE-04)
   // menu only: the game window's shape, which is the render resolution in windowed mode
   // Defaults are the settings that rendered best in the headset (2026-10-05): VR eye, Matched, 2160 px. The shape is
@@ -134,7 +131,6 @@ struct Settings {
   float eye_scale = 0.f;   // 0 = legacy height/aspect sizing; otherwise percent of OpenXR's recommended eye pixels
   bool menus_mono = true;  // stereo only in gameplay; mono cinema screen on the start-up screens and in menus
   bool menu_stereo = true; // "nomenustereo": the 3D main menu (front end) stays mono on the flat screen (2026-11-09)
-  bool zerosep = false;    // "zerosep": test, both eyes rendered from the same point (no parallax)
   bool vegsync = true;     // off = "novegsync": the second view's animation clock follows the main view's
   bool level = true;       // off = "nolevel": mouse / gamepad turn left-right only, the head looks up and down
   bool eye_ui = true;      // off = "noeyeui": the game UI in both eyes (main-view slot +0x130 shared)
@@ -255,11 +251,7 @@ void load_settings() {
     // Animation sync is always on (it fixed the wind desync, 2026-10-07); the test settings below have no menu rows
     // any more, so values left in the file by earlier tests are dropped.
     g_s.vegsync = true;
-    g_s.zerosep = false;
     g_s.share_slot = 0.f;
-    g_s.shadowfix = std::strstr(text, "shadowfix") != nullptr;
-    g_s.flatfollow = std::strstr(text, "flatfollow") != nullptr;
-    g_s.shadowunion = std::strstr(text, "shadowunion") != nullptr;
     g_s.lodfov = std::strstr(text, "lodfov") != nullptr;
     g_s.outsizerender = std::strstr(text, "outsizerender") != nullptr;
     g_s.fxstretch = std::strstr(text, "fxstretch") != nullptr;
@@ -400,18 +392,6 @@ void apply_native() {
     if (!g_s.vegsync) {
       n += snprintf(text + n, sizeof(text) - n, " novegsync");
     }
-    if (g_s.zerosep) {
-      n += snprintf(text + n, sizeof(text) - n, " zerosep");
-    }
-    if (g_s.shadowfix) {
-      n += snprintf(text + n, sizeof(text) - n, " shadowfix");
-    }
-    if (g_s.flatfollow) {
-      n += snprintf(text + n, sizeof(text) - n, " flatfollow");
-    }
-    if (g_s.shadowunion) {
-      n += snprintf(text + n, sizeof(text) - n, " shadowunion");
-    }
     if (g_s.lodfov) {
       n += snprintf(text + n, sizeof(text) - n, " lodfov");
     }
@@ -507,7 +487,7 @@ void apply_xr() {
 // ---- menu model -----------------------------------------------------------------------------------------
 
 enum class Kind { Toggle, Choice, Float, Int, Action };
-enum class Target { None, Native, Xr, Menu, Shape };
+enum class Target { None, Native, Xr, Menu, Shape, Tuner };
 
 struct Row {
   const char* label;
@@ -525,6 +505,8 @@ struct Row {
   const char* choices[4] = {};  // Toggle: {off, on}; Choice uses i with these labels
   int choice_count = 0;
   void (*action)() = nullptr;
+  const char* const* list = nullptr;  // Choice with more than 4 labels (Hands tab)
+  bool snap = true;                   // Float: round to the step grid (off keeps fine stored values)
 };
 
 void act_recentre_view();
@@ -545,9 +527,10 @@ struct Tab {
   int count;
 };
 
-constexpr int kTabCount = 6;  // 5 = Scripts (lua_host, rebuilt when its rows change)
+constexpr int kTabCount = 8;  // 5 = Scripts (lua_host, rebuilt when its rows change), 6 = Tuner (tools/ik_tuner pages)
 Tab g_tabs[kTabCount];
 int g_tab = 0;
+
 int g_sel = 0;  // -1 = the tab strip
 
 Row toggle(const char* label, const char* help, Target t, bool* b, const char* off = "Off", const char* on = "On") {
@@ -613,6 +596,10 @@ void add(Tab& tab, const Row& r) {
 }
 
 void build_tabs() {
+  Tab& advanced = g_tabs[7];
+  advanced.name = "Advanced";
+  advanced.count = 0;
+
   Tab& stereo = g_tabs[0];
   stereo.name = "Stereo";
   stereo.count = 0;
@@ -678,24 +665,10 @@ void build_tabs() {
                    "lens shows least (more from the bottom) and renders fewer rows, so detail per degree stays the same and "
                    "GPU time falls. Raise Eye resolution scale with the saving to get a sharper image. Needs Matched FOV.",
                    Target::Shape, &g_s.vcrop, 60.f, 100.f, 1.f, "%.0f%%"));
-  add(view, toggle("Centred eye projection (test)",
+  add(advanced, toggle("Centred eye projection (test)",
                    "Test for light/shadow and shape shifts with head turns: each eye renders a frustum centred on where it "
                    "looks (covering the same lens area), instead of the off-centre one. Slightly softer image. Off = current.",
                    Target::Native, &g_s.symproj));
-  add(view, toggle("Per-eye sun shadows (test)",
-                   "Fix test for sun shadows that show in one eye only: each eye resolves its shadows from its own "
-                   "shadow history instead of the one both eyes share. Off = current.",
-                   Target::Native, &g_s.shadowfix));
-  add(view, toggle("Flat camera follows head (test)",
-                   "Test for shapes, lights and shadows that change with head turns: the game's flat camera turns with "
-                   "the headset and covers both eye views, so systems that still use it match what you see. The "
-                   "crosshair and scan targeting follow your head while on. Off = current.",
-                   Target::Native, &g_s.flatfollow));
-  add(view, toggle("Same shadow lights both eyes (fix)",
-                   "Fix for shadows that show in one eye only: the game picks a limited set of shadow-casting lights per eye "
-                   "from what that eye sees, so the eyes disagree near the edges. On: both eyes pick from their combined view "
-                   "and get the same set. Off = current.",
-                   Target::Native, &g_s.shadowunion));
   add(view, toggle("Full-screen effects fill the eye (fix)",
                    "Fix for the X-ray scan, mount boost and flash grenade showing as a 16:9 box (or a corner patch) with black "
                    "around it: the game draws those effects as one picture in its UI layer, which the HUD placement shrinks. "
@@ -707,7 +680,7 @@ void build_tabs() {
                    "they get the eye size instead. Off = current.",
                    Target::Native, &g_s.outsizerender));
   add(view, toggle("Per-eye lens projection",
-                   "Each eye renders exactly its own lens field of view (off-centre, like the Cyberpunk VR port) instead of "
+                   "Each eye renders exactly its own lens field of view (off-centre) instead of "
                    "the symmetric union of both: the same pixels cover only what that lens shows, so more pixels per degree "
                    "and the outer edge is covered. HUD placement follows each eye's frustum. Off = symmetric union.",
                    Target::Native, &g_s.eyeshift));
@@ -728,13 +701,13 @@ void build_tabs() {
                    "With Detail independent of VR FOV on: model and terrain detail use the reference FOV, but texture "
                    "streaming keeps the game's own level. Saves GPU memory and bandwidth. Off = textures also use the reference.",
                    Target::Native, &g_s.lodtexgame));
-  add(view, toggle("LOD probe (read-only)", "Logs how the two eyes decide near/far detail for objects: eye disagreements "
+  add(advanced, toggle("LOD probe (read-only)", "Logs how the two eyes decide near/far detail for objects: eye disagreements "
                    "and flips while the head is still vs turning. Changes nothing visible.", Target::Native, &g_s.lodprobe));
-  add(view, toggle("Vegetation tile probe (read-only)", "Logs how terrain/vegetation detail tiles collapse when they leave each "
+  add(advanced, toggle("Vegetation tile probe (read-only)", "Logs how terrain/vegetation detail tiles collapse when they leave each "
                    "eye's view and rebuild when they return, head still vs turning. Changes nothing visible.", Target::Native, &g_s.qtprobe));
-  add(view, toggle("Spot-shadow slot probe (read-only)", "Logs which atlas slot each lamp shadow uses in each eye, to find lamps "
+  add(advanced, toggle("Spot-shadow slot probe (read-only)", "Logs which atlas slot each lamp shadow uses in each eye, to find lamps "
                    "whose shadow shows in one eye only. Changes nothing visible.", Target::Native, &g_s.spotprobe));
-  add(view, slider("Glow test (detail group)",
+  add(advanced, slider("Glow test (detail group)",
                    "Diagnostic with Detail independent of VR FOV on: puts ONE group back on the game's original detail to "
                    "find what switches the fauna glow off. 0 off, 1 model detail, 2 culling, 3 texture streaming, "
                    "4 unknown system, 5 all four, 6 culling first half only, 7 culling second half only, 8 light culling only, "
@@ -876,7 +849,7 @@ void build_tabs() {
          "headset gets its full refresh rate while the game renders fewer frames (best: headset 90 Hz, game 45-60 fps, "
          "Virtual Desktop SSW off). No added delay. The HUD and the edges of fast-moving objects can smear. Off = as before.",
          Target::Xr, &g_s.framegen));
-  add(headset, toggle("Frame generation test: no motion",
+  add(advanced, toggle("Frame generation test: no motion",
          "Test for the dark flashes: generated frames repeat the last game frame without moving it forward. If the "
          "flashes stay with this on, the motion prediction is not their cause. Needs Frame generation (mod) on.",
          Target::Xr, &g_s.framegen_k0));
@@ -884,7 +857,7 @@ void build_tabs() {
          "Live state of the mod's frame generation: game frames and generated frames per second, and the GPU time of "
          "one generated frame pair. Read-only.", nullptr));
   add(headset, toggle("Send depth to headset",
-         "For frame generation layers (VectorXR) and the headset runtime: each eye's depth is sent with its image, which "
+         "For compatible frame generation layers and the headset runtime: each eye's depth is sent with its image, which "
          "keeps hands, gun and nearby objects steadier in generated frames. Small GPU cost. Off = as before.",
          Target::Xr, &g_s.xr_depth));
   // Removed 2026-10-07: "Eye timing", "Right/Left eye delay" (fallback only: each frame's pose is known exactly).
@@ -916,16 +889,641 @@ void build_tabs() {
          "frame submission, VR eye shape at 2160 px.",
          &act_preset));
   add(menu, action("Capture eyes (F9)",
-                   "Saves the left and right eye images of the next frame side by side to scripts\\captures\\eyes_<time>.jpg. "
+                   "Saves the left and right eye images of the next frame side by side to scripts\\AvatarVR\\captures\\eyes_<time>.jpg. "
                    "F9 does the same in game without opening the menu.",
                    &act_capture));
-  add(menu, action("Capture motion (3 frames)",
+  add(advanced, action("Capture motion (3 frames)",
                    "Closes this menu and saves three stereo eye pairs plus raw and repaired motion vectors and depth. "
-                   "Use while moving a hand or gun near the view. Files go to scripts\\captures.", &act_mv_burst));
+                   "Use while moving a hand or gun near the view. Files go to scripts\\AvatarVR\\captures.", &act_mv_burst));
   // Removed 2026-10-09 (answered; code in research/debug_archive/2026-10-09_testers, notes in research/DEBUG_TESTERS.md):
   // "Character sweep: slots", "Same-point eye test", "VFX test: fire / smoke" (+ F8), "Capture motion vectors",
   // "Character buffer probe", "Frame counter search".
   add(menu, action("Close menu", "Same as F10.", &act_close));
+}
+
+void build_tuner_tab();
+
+// ---- Tuner tab: tools/ik_tuner inside the VR menu ([AUTHOR 2026-11-17]) ------------------------------------
+// Pages: Fingers (gesture poses + thumb helpers, AvatarVR_ik_tune.txt gesture.*), Mounted arms (tp.* in the same
+// file), HUD on arm (AvatarVR_hud_widgets.txt) and Full-view effects (AvatarVR_fullview_fx.txt). Every change re-reads
+// its file and rewrites it, keeping what other tools wrote; the mod re-reads them about four times a second. Do not
+// run the desktop tuner at the same time: it rewrites the files from its own state.
+enum TunerPage { kPageFingers, kPageArms, kPageHud, kPageEffects, kPageCount };
+int g_tuner_page = kPageFingers;
+const char* const kTunerPageLabels[kPageCount] = {"Fingers", "Mounted arms", "HUD on arm", "Full-view effects"};
+
+std::string tuner_read(const wchar_t* name, bool* ok = nullptr) {
+  std::string text;
+  FILE* f = nullptr;
+  const auto path = g_dir + L"\\" + name;
+  if (settings_file::owns(path)) {
+    if (ok) *ok = true;
+    settings_file::read(path, text);
+    return text;
+  }
+  if (ok) *ok = true;
+  if (_wfopen_s(&f, (g_dir + L"\\" + name).c_str(), L"rb") != 0 || f == nullptr) return text;  // absent: defaults
+  char bytes[8192];
+  size_t got = 0;
+  while ((got = fread(bytes, 1, sizeof(bytes), f)) > 0) text.append(bytes, got);
+  if (ferror(f) != 0 && ok) *ok = false;
+  fclose(f);
+  return text;
+}
+bool tuner_write(const wchar_t* name, const std::string& text) {
+  const std::wstring path = g_dir + L"\\" + name, tmp = path + L".menu.tmp";
+  if (settings_file::owns(path)) return settings_file::write(path, text);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0 || f == nullptr) return false;
+  const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+  fclose(f);
+  if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    log_line("tuner: write failed (%lu)", GetLastError());
+    DeleteFileW(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+double tuner_wall_seconds() {
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  ULARGE_INTEGER v;
+  v.LowPart = ft.dwLowDateTime;
+  v.HighPart = ft.dwHighDateTime;
+  return static_cast<double>(v.QuadPart) / 10000000. - 11644473600.;
+}
+constexpr const wchar_t* kTuneFile = L"AvatarVR_ik_tune.txt";
+bool tune_load(gesture_edit::File& file) {
+  bool ok = false;
+  const std::string text = tuner_read(kTuneFile, &ok);
+  if (ok) file.parse(text);
+  return ok;
+}
+bool tune_save(const gesture_edit::File& file) { return tuner_write(kTuneFile, file.text()); }
+
+Row list_row(const char* label, const char* help, int* i, const char* const* list, int count) {
+  Row r{label, help, Kind::Choice, Target::Tuner};
+  r.i = i;
+  r.list = list;
+  r.choice_count = std::max(count, 1);
+  return r;
+}
+Row tuner_slider(const char* label, const char* help, float* f, float lo, float hi, float step, const char* fmt) {
+  Row r = slider(label, help, Target::Tuner, f, lo, hi, step, fmt);
+  r.snap = false;  // keep fine stored values; a step adds exactly one step
+  return r;
+}
+const char* step_fmt(float step) { return step >= 1.f ? "%.1f" : step >= 0.05f ? "%.2f" : "%.3f"; }
+
+// ---- Fingers page --------------------------------------------------------------------------------------------
+int g_hand_side = 0, g_hand_combo = 11, g_hand_rig = 0, g_hand_bone = 1;
+bool g_hand_preview = false, g_hand_mirror = false;
+float g_hand_axis[gesture_edit::axis_count] = {};
+const char* const kHandComboLabels[hand_gestures::combination_count] = {
+    "Open", "Thumb folded", "Index touch", "Index + thumb touch", "Index press", "Index press + thumb",
+    "Finger gun", "Point", "Squeeze + index touch", "Squeeze + index + thumb", "Thumbs up", "Fist", "Relaxed idle"};
+char g_bone_label_text[gesture_edit::bone_count][48] = {};
+const char* g_bone_labels[gesture_edit::bone_count] = {};
+struct BoneClip { bool have = false, helper = false; float v[gesture_edit::axis_count] = {}; } g_bone_clip;
+long long g_capture_id = 0;
+double g_capture_deadline = 0;
+char g_capture_text[200] = "Copies the game's current finger animation on the selected hand into this pose, then edit. "
+                           "Needs gameplay with Arm IK and Empty-hand gestures on, hand in view.";
+char g_live_text[160] = "Live: no fresh gesture status yet";
+
+void fingers_labels() {
+  static const char* fingers[4] = {"Thumb", "Index", "Lower finger 1", "Lower finger 2"};
+  for (int b = 0; b < gesture_edit::bone_count; ++b) {
+    if (b < 4) snprintf(g_bone_label_text[b], sizeof(g_bone_label_text[b]), "%s", fingers[b]);
+    else snprintf(g_bone_label_text[b], sizeof(g_bone_label_text[b]), "Thumb helper: %s", hand_gestures::helper_name(b - 4));
+    g_bone_labels[b] = g_bone_label_text[b];
+  }
+}
+void fingers_preview_keys(gesture_edit::File& file, bool on) {
+  file.preview(on, g_hand_rig, g_hand_side, g_hand_combo, tuner_wall_seconds() + 2.);
+}
+void fingers_refresh() {
+  gesture_edit::File file;
+  tune_load(file);
+  for (int a = 0; a < gesture_edit::bone_axis_count(g_hand_bone); ++a)
+    g_hand_axis[a] = file.get_bone(g_hand_rig, g_hand_side, g_hand_combo, g_hand_bone, a);
+}
+void fingers_capture_keys(gesture_edit::File& file) {
+  const bool waiting = g_capture_id != 0 && tuner_wall_seconds() < g_capture_deadline;
+  file.values["gesture.capture_hand"] = waiting ? g_hand_side : -1;
+  file.values["gesture.capture_id"] = waiting ? static_cast<double>(g_capture_id) : 0.;
+  file.values["gesture.capture_until"] = waiting ? g_capture_deadline : 0.;
+}
+void fingers_save(gesture_edit::File& file) {
+  if (g_hand_mirror) file.copy_pose(g_hand_rig, g_hand_side, g_hand_combo, g_hand_rig, 1 - g_hand_side);
+  fingers_preview_keys(file, g_hand_preview);
+  tune_save(file);
+}
+void fingers_pose_action(int to_rig, int to_hand, bool reset, const char* what) {
+  gesture_edit::File file;
+  if (!tune_load(file)) return;
+  if (reset) file.reset_pose(g_hand_rig, g_hand_side, g_hand_combo);
+  else file.copy_pose(g_hand_rig, g_hand_side, g_hand_combo, to_rig, to_hand);
+  fingers_preview_keys(file, g_hand_preview);
+  if (tune_save(file)) log_line("tuner: %s (%s %s %s)", what, g_hand_rig ? "mounted" : "on foot", g_hand_side ? "right" : "left",
+                                hand_gestures::combination_name(g_hand_combo));
+  fingers_refresh();
+}
+void act_fingers_copy_hand() { fingers_pose_action(g_hand_rig, 1 - g_hand_side, false, "pose copied to the other hand"); }
+void act_fingers_copy_rig() { fingers_pose_action(1 - g_hand_rig, g_hand_side, false, "pose copied to the other set"); }
+void act_fingers_reset() { fingers_pose_action(g_hand_rig, g_hand_side, true, "pose reset to default"); }
+void act_fingers_copy_bone() {
+  g_bone_clip.have = true;
+  g_bone_clip.helper = gesture_edit::is_helper(g_hand_bone);
+  std::copy(std::begin(g_hand_axis), std::end(g_hand_axis), std::begin(g_bone_clip.v));
+}
+void act_fingers_paste_bone() {
+  if (!g_bone_clip.have || g_bone_clip.helper != gesture_edit::is_helper(g_hand_bone)) return;  // fingers and helpers differ
+  gesture_edit::File file;
+  if (!tune_load(file)) return;
+  for (int a = 0; a < gesture_edit::bone_axis_count(g_hand_bone); ++a)
+    file.set_bone(g_hand_rig, g_hand_side, g_hand_combo, g_hand_bone, a, g_bone_clip.v[a]);
+  fingers_save(file);
+  fingers_refresh();
+}
+void act_fingers_capture() {
+  g_capture_id = static_cast<long long>(tuner_wall_seconds() * 1000.) % 1000000000LL;
+  g_capture_deadline = tuner_wall_seconds() + 5.;
+  snprintf(g_capture_text, sizeof(g_capture_text), "Capturing the %s hand... keep it visible in game.", g_hand_side ? "right" : "left");
+  gesture_edit::File file;
+  if (!tune_load(file)) return;
+  fingers_capture_keys(file);
+  fingers_preview_keys(file, g_hand_preview);
+  tune_save(file);
+}
+// Waits for the mod's AvatarVR_gesture_capture.json reply with our id, then stores it into the selected pose.
+void fingers_capture_poll() {
+  if (g_capture_id == 0) return;
+  gesture_edit::File file;
+  if (tuner_wall_seconds() >= g_capture_deadline) {
+    g_capture_id = 0;
+    snprintf(g_capture_text, sizeof(g_capture_text),
+             "Capture timed out. Needs gameplay with Arm IK and Empty-hand gestures on, hand in view.");
+    if (tune_load(file)) { fingers_capture_keys(file); tune_save(file); }
+    return;
+  }
+  tuner_model::Capture reply;
+  if (!tuner_model::parse_capture(tuner_read(L"AvatarVR\\state\\AvatarVR_gesture_capture.json"), reply) || reply.id != g_capture_id) return;
+  g_capture_id = 0;
+  if (!tune_load(file)) return;
+  g_hand_rig = reply.mounted ? 1 : 0;
+  int stored = 0;
+  for (const auto& v : reply.values) {
+    int b = 0, a = 0;
+    if (!gesture_edit::bone_axis_of(v.first, b, a)) continue;
+    file.set_bone(g_hand_rig, g_hand_side, g_hand_combo, b, a, static_cast<float>(v.second));
+    ++stored;
+  }
+  fingers_capture_keys(file);
+  fingers_save(file);
+  fingers_refresh();
+  snprintf(g_capture_text, sizeof(g_capture_text), "Captured %d values into '%s' (%s). Fit error %.1f mm / %.1f deg%s.", stored,
+           kHandComboLabels[g_hand_combo], g_hand_rig ? "mounted" : "on foot", reply.position_mm, reply.angle_deg,
+           reply.clamped ? ", some values hit their limits" : "");
+}
+void fingers_live_poll() {
+  const std::string json = tuner_read(L"AvatarVR\\state\\AvatarVR_gesture_status.json");
+  double at = 0, owners[2] = {}, combo[2] = {}, weight[2] = {}, tracked[2] = {1, 1}, mounted = 0, moving = 0;
+  if (!tuner_model::json_number(json, "at", at) || tuner_wall_seconds() - at > 3. || !tuner_model::json_pair(json, "owners", owners) ||
+      !tuner_model::json_pair(json, "combo", combo) || !tuner_model::json_pair(json, "weight", weight)) {
+    snprintf(g_live_text, sizeof(g_live_text), "Live: no fresh gesture status (needs gameplay, Arm IK, Empty-hand gestures)");
+    return;
+  }
+  tuner_model::json_pair(json, "tracked", tracked);
+  tuner_model::json_number(json, "mounted", mounted);
+  tuner_model::json_number(json, "moving", moving);
+  static const char* owner_names[] = {"unknown", "empty", "weapon", "item", "support", "harness", "swapping"};
+  auto owner = [&](int h) { const int o = static_cast<int>(owners[h]); return o >= 0 && o < 7 ? owner_names[o] : "unknown"; };
+  auto combo_name = [&](int h) { const int c = static_cast<int>(combo[h]); return c >= 0 && c < 13 ? kHandComboLabels[c] : "?"; };
+  snprintf(g_live_text, sizeof(g_live_text), "%s%s  L %s, %s %.2f%s  R %s, %s %.2f%s", mounted != 0 ? "Mounted" : "On foot",
+           moving != 0 ? " moving" : "", owner(0), combo_name(0), weight[0], tracked[0] != 0 ? "" : " LOST", owner(1), combo_name(1),
+           weight[1], tracked[1] != 0 ? "" : " LOST");
+}
+void act_fingers_live() { fingers_live_poll(); }
+
+void build_fingers_rows(Tab& t) {
+  fingers_labels();
+  const char* sel_help = "Pick the pose to edit. Same values as the desktop tuner's Finger gestures page; close that tuner while "
+                         "editing here. Needs Arm IK and Empty-hand gestures on.";
+  Row hand = choice("Hand", sel_help, Target::Tuner, &g_hand_side, "Left", "Right", "");
+  hand.choice_count = 2;
+  add(t, hand);
+  add(t, list_row("Pose", "Controller combination this pose belongs to. Squeeze and trigger travel blend between poses.",
+                  &g_hand_combo, kHandComboLabels, hand_gestures::combination_count));
+  add(t, toggle("Preview pose",
+                "Shows the selected pose on the selected empty hand while this menu is open, without holding the combination. "
+                "Item, weapon, two-hand and cinematic ownership still win. Off to test real input.",
+                Target::Tuner, &g_hand_preview));
+  add(t, list_row("Bone", "Which finger the values below edit, or one of the thumb webbing/deformation helpers (advanced: "
+                  "local bone axes, start at 0; missing bones in a mesh have no effect).",
+                  &g_hand_bone, g_bone_labels, gesture_edit::bone_count));
+  Row rig = choice("Pose set", "On foot is also used while riding unless gesture.mounted_context=1 is in the tune file. "
+                   "Preview only shows where you are (on foot or mounted).", Target::Tuner, &g_hand_rig, "On foot", "Mounted", "");
+  rig.choice_count = 2;
+  add(t, rig);
+  add(t, toggle("Mirror edits to other hand", "Every change also copies this whole pose onto the other hand (same set and pose); "
+                "the hand you edit overwrites the other.", Target::Tuner, &g_hand_mirror));
+  add(t, action(g_live_text, "Live input per hand: owner, current pose and blend weight. Select to refresh; it also refreshes "
+                "by itself while this page is open.", &act_fingers_live));
+  const bool helper = gesture_edit::is_helper(g_hand_bone);
+  for (int a = 0; a < gesture_edit::bone_axis_count(g_hand_bone); ++a) {
+    float lo, hi, step;
+    gesture_edit::bone_axis_range(g_hand_bone, a, lo, hi, step);
+    const char* help = helper ? "Adjusts only this thumb helper bone, in its own axes; does not move the finger chain or the wrist."
+                       : gesture_edit::axis_is_position(a) ? "Moves the whole finger base in the palm, in millimetres. 0 keeps the saved pose."
+                       : "Degrees. Base values move the whole finger; 01/02/03 are its three joints. Bend curls toward the palm, "
+                         "sideways opens the finger, skin roll twists it (use sparingly).";
+    add(t, tuner_slider(gesture_edit::bone_axis_label(g_hand_bone, a), help, &g_hand_axis[a], lo, hi, step,
+                        step < 1.f ? "%.2f" : "%.1f"));
+  }
+  add(t, action("Copy bone values", "Copies the values above; switch hand, pose or bone, then Paste. Fingers paste onto fingers, "
+                "helpers onto helpers.", &act_fingers_copy_bone));
+  add(t, action("Paste bone values", "Writes the copied values onto the selected bone.", &act_fingers_paste_bone));
+  add(t, action("Capture native pose", g_capture_text, &act_fingers_capture));
+  add(t, action("Copy pose to other hand", "Copies this whole pose (all fingers and thumb helpers) onto the other hand.",
+                &act_fingers_copy_hand));
+  add(t, action("Copy pose to other set", "Copies this whole pose onto the other pose set (on foot / mounted).", &act_fingers_copy_rig));
+  add(t, action("Reset this pose", "Removes this pose's edits for the selected hand and set (all fingers and thumb helpers).",
+                &act_fingers_reset));
+}
+void fingers_changed(const Row& r) {
+  gesture_edit::File file;
+  if (!tune_load(file)) return;
+  for (int a = 0; a < gesture_edit::bone_axis_count(g_hand_bone); ++a) {
+    if (r.f == &g_hand_axis[a]) {
+      file.set_bone(g_hand_rig, g_hand_side, g_hand_combo, g_hand_bone, a, g_hand_axis[a]);
+      fingers_save(file);
+      return;
+    }
+  }
+  if (r.b == &g_hand_mirror && !g_hand_mirror) return;
+  if (r.i == &g_hand_bone) build_tuner_tab();  // fingers and helpers have different rows
+  for (int a = 0; a < gesture_edit::bone_axis_count(g_hand_bone); ++a)
+    g_hand_axis[a] = file.get_bone(g_hand_rig, g_hand_side, g_hand_combo, g_hand_bone, a);
+  fingers_save(file);
+}
+
+// ---- Mounted arms page ---------------------------------------------------------------------------------------
+int g_arm_edit = 0;  // 0 shared, 1 left trims, 2 right trims
+float g_arm_vals[24] = {};
+char g_arm_label_text[24][64] = {};
+const std::vector<tuner_model::ArmSpec>& arm_specs() {
+  return g_arm_edit == 0 ? tuner_model::shared_arm_specs() : tuner_model::side_arm_specs(g_arm_edit - 1);
+}
+void arms_refresh() {
+  gesture_edit::File file;
+  tune_load(file);
+  const auto arms = tuner_model::settings_section(tuner_read(L"AvatarVR_settings.ini"), "arms");
+  const auto& specs = arm_specs();
+  for (size_t i = 0; i < specs.size() && i < 24; ++i) {
+    const auto& s = specs[i];
+    const auto it = file.values.find(s.key);
+    bool inheriting = false;
+    if (it != file.values.end()) g_arm_vals[i] = static_cast<float>(it->second);
+    else if (s.inherit != nullptr) {
+      const auto fp = arms.find(s.inherit);
+      g_arm_vals[i] = fp != arms.end() ? static_cast<float>(fp->second) : s.def;
+      inheriting = true;
+    } else g_arm_vals[i] = s.def;
+    snprintf(g_arm_label_text[i], sizeof(g_arm_label_text[i]), "%s%s%s%s", s.label.c_str(), s.unit[0] ? " (" : "", s.unit,
+             s.unit[0] ? (inheriting ? ", on-foot)" : ")") : (inheriting ? " (on-foot)" : ""));
+  }
+}
+void arms_erase(bool only_angles) {
+  gesture_edit::File file;
+  if (!tune_load(file)) return;
+  for (const auto& s : arm_specs())
+    if (!only_angles || s.inherit != nullptr) file.values.erase(s.key);
+  tune_save(file);
+  arms_refresh();
+}
+void act_arms_onfoot() { arms_erase(true); }
+void act_arms_reset() { arms_erase(false); }
+void build_arms_rows(Tab& t) {
+  static const char* const edits[3] = {"Shared (both arms)", "Left arm adjustments", "Right arm adjustments"};
+  add(t, list_row("Edit", "Shared values set both mounted arms. Left / Right adjustments add to them for one arm only; zero keeps "
+                  "the shared setup. Side/out is outward; angle trims apply after mirroring.", &g_arm_edit, edits, 3));
+  arms_refresh();
+  const auto& specs = arm_specs();
+  for (size_t i = 0; i < specs.size() && i < 24; ++i) {
+    const auto& s = specs[i];
+    add(t, tuner_slider(g_arm_label_text[i], s.help, &g_arm_vals[i], s.lo, s.hi, s.step,
+                        s.step >= 1.f ? "%.0f" : step_fmt(s.step)));
+  }
+  if (g_arm_edit == 0)
+    add(t, action("Use on-foot hand angles", "Removes the mounted hand pitch/yaw/roll so they follow the on-foot hand tune again.",
+                  &act_arms_onfoot));
+  add(t, action(g_arm_edit == 0 ? "Reset shared values" : "Reset these adjustments to zero",
+                "Removes these keys from the tune file; the mod then uses its defaults (zero for adjustments).", &act_arms_reset));
+}
+void arms_changed(const Row& r) {
+  if (r.i == &g_arm_edit) {
+    build_tuner_tab();
+    return;
+  }
+  const auto& specs = arm_specs();
+  for (size_t i = 0; i < specs.size() && i < 24; ++i) {
+    if (r.f != &g_arm_vals[i]) continue;
+    gesture_edit::File file;
+    if (!tune_load(file)) return;
+    float v = std::clamp(g_arm_vals[i], specs[i].lo, specs[i].hi);
+    if (specs[i].key == "tp.mount_correction") v = v >= .5f ? 1.f : 0.f;  // the mod accepts only 0 or 1
+    file.values[specs[i].key] = v;
+    tune_save(file);
+    arms_refresh();
+    return;
+  }
+}
+
+// ---- HUD on arm page -----------------------------------------------------------------------------------------
+constexpr const wchar_t* kHudFile = L"AvatarVR_hud_widgets.txt";
+int g_hud_element = 0, g_hud_group = 0, g_hud_attach = 0, g_hud_bone = 0, g_hud_frame = 1;
+bool g_hud_two_sided = false;
+float g_hud_vals[8] = {};  // along side lift yaw pitch roll scale shrink
+constexpr int kHudValueField[8] = {tuner_model::HAlong, tuner_model::HSide, tuner_model::HLift, tuner_model::HYaw,
+                                   tuner_model::HPitch, tuner_model::HRoll, tuner_model::HScale, tuner_model::HShrink};
+std::vector<std::pair<std::string, std::vector<int>>> g_hud_groups;
+std::vector<const char*> g_hud_group_labels;
+std::vector<std::pair<int, std::string>> g_hud_bones;
+std::vector<const char*> g_hud_bone_labels;
+const char* g_hud_element_labels[tuner_model::kHudCount] = {};
+
+void hud_lists() {
+  for (int e = 0; e < tuner_model::kHudCount; ++e) g_hud_element_labels[e] = tuner_model::kHudElements[e].label;
+  g_hud_groups = tuner_model::hud_groups(tuner_read(L"AvatarVR_hud_groups.json"));
+  g_hud_group_labels.assign(1, "Just this element");
+  for (const auto& g : g_hud_groups) g_hud_group_labels.push_back(g.first.c_str());
+  g_hud_bones = tuner_model::bone_list(tuner_read(L"AvatarVR\\state\\AvatarVR_hud_bones.txt"));
+  g_hud_bone_labels.clear();
+  for (const auto& b : g_hud_bones) g_hud_bone_labels.push_back(b.second.c_str());
+  if (g_hud_bone_labels.empty()) g_hud_bone_labels.push_back("No bone list yet (Native HUD on arm, gameplay)");
+  g_hud_group = std::clamp(g_hud_group, 0, static_cast<int>(g_hud_group_labels.size()) - 1);
+}
+std::vector<int> hud_selected() {
+  std::vector<int> out{g_hud_element};
+  if (g_hud_group > 0 && g_hud_group <= static_cast<int>(g_hud_groups.size()))
+    for (int e : g_hud_groups[g_hud_group - 1].second) if (e != g_hud_element) out.push_back(e);
+  return out;
+}
+void hud_show(const tuner_model::Hud& hud) {
+  const auto& v = hud.v[g_hud_element];
+  g_hud_attach = std::clamp(static_cast<int>(v[tuner_model::HAttach]), 0, tuner_model::kHudAttachCount - 1);
+  g_hud_two_sided = v[tuner_model::HTwoSided] != 0.f;
+  g_hud_frame = std::clamp(hud.frame, 0, 2);
+  for (int i = 0; i < 8; ++i) g_hud_vals[i] = v[kHudValueField[i]];
+  g_hud_bone = 0;
+  for (size_t b = 0; b < g_hud_bones.size(); ++b)
+    if (g_hud_bones[b].first == static_cast<int>(v[tuner_model::HBone])) g_hud_bone = static_cast<int>(b);
+}
+void hud_refresh() {
+  tuner_model::Hud hud;
+  hud.parse(tuner_read(kHudFile));
+  hud_show(hud);
+}
+void hud_edit(void (*fn)(tuner_model::Hud&)) {
+  tuner_model::Hud hud;
+  bool ok = false;
+  hud.parse(tuner_read(kHudFile, &ok));
+  if (!ok) return;
+  fn(hud);
+  tuner_write(kHudFile, hud.text());
+  hud_show(hud);
+}
+void act_hud_reset() { hud_edit([](tuner_model::Hud& h) { h.reset(hud_selected()); }); }
+void act_hud_line_up() { hud_edit([](tuner_model::Hud& h) { h.line_up(hud_selected(), g_hud_element); }); }
+void act_hud_reload_bones() {
+  hud_lists();
+  hud_refresh();
+  build_tuner_tab();
+}
+void build_hud_rows(Tab& t) {
+  hud_lists();
+  hud_refresh();
+  add(t, list_row("Element", "The game's HUD element to place. Turn on UI > Native HUD on arm.", &g_hud_element,
+                  g_hud_element_labels, tuner_model::kHudCount));
+  add(t, list_row("Move together with", "A group moves with the element: positions and angles by the same amount, size scaled, "
+                  "attach and bone set. Groups come from the desktop tuner (AvatarVR_hud_groups.json).", &g_hud_group,
+                  g_hud_group_labels.data(), static_cast<int>(g_hud_group_labels.size())));
+  add(t, list_row("Attach to", "Where the element lives. Out of view stays hidden. While mounted, arms and hands still work, but a "
+                  "specific bone is hidden. Weapon uses the hand. Head starts 30 cm in front of your eyes.", &g_hud_attach,
+                  tuner_model::hud_attach_labels(), tuner_model::kHudAttachCount));
+  add(t, list_row("Bone", "For Attach to: Specific bone. Choosing a bone also sets that attach. The sliders then follow the bone's "
+                  "own axes.", &g_hud_bone, g_hud_bone_labels.data(), static_cast<int>(g_hud_bone_labels.size())));
+  static const char* labels[8] = {"Along (m)", "Sideways (m)", "Off the surface (m)", "Yaw", "Pitch", "Roll", "Size", "Reticle shrink"};
+  static const char* helps[8] = {"Arm, hand: toward the elbow. Weapon, head: forward.", "Across the arm or gun. Reticle: angle.",
+                                 "Off the surface. Weapon, head: up. Reticle: angle.", "Degrees.", "Degrees.", "Degrees.",
+                                 "Size of the element (reticle size too).", "Reticle: smaller when far (0 same size, 1 like a real object)."};
+  static const float lo[8] = {-.6f, -.3f, -.1f, -180, -180, -180, .2f, 0}, hi[8] = {.6f, .3f, .2f, 180, 180, 180, 4, 1},
+                     step[8] = {.005f, .005f, .005f, 1, 1, 1, .05f, .05f};
+  for (int i = 0; i < 8; ++i) add(t, tuner_slider(labels[i], helps[i], &g_hud_vals[i], lo[i], hi[i], step[i], step_fmt(step[i])));
+  add(t, toggle("Show from behind", "Off: hidden when you are not facing it.", Target::Tuner, &g_hud_two_sided));
+  add(t, choice("Stability method", "Walk and stick-turn; keep whichever stays stuck to the bone. A is the default.", Target::Tuner,
+                &g_hud_frame, "B: newest frame", "A: rendering frame", "C: arm rig frame"));
+  add(t, action("Reset selected", "Puts the element (and its group) back to the defaults.", &act_hud_reset));
+  add(t, action("Line up selected", "Gives the group the element's values; health, energy and prompts then keep the game's arrangement.",
+                &act_hud_line_up));
+  add(t, action("Reload bone list", "Re-reads the bone names the mod writes once it has read the skeleton.", &act_hud_reload_bones));
+}
+void hud_changed(const Row& r) {
+  if (r.i == &g_hud_element || r.i == &g_hud_group) {
+    hud_refresh();
+    return;
+  }
+  tuner_model::Hud hud;
+  bool ok = false;
+  hud.parse(tuner_read(kHudFile, &ok));
+  if (!ok) return;
+  const auto selected = hud_selected();
+  if (r.i == &g_hud_attach) hud.attach(selected, g_hud_element, g_hud_attach);
+  else if (r.i == &g_hud_bone && !g_hud_bones.empty()) {
+    hud.attach(selected, g_hud_element, tuner_model::kHudBoneAttach);
+    hud.set(selected, g_hud_element, tuner_model::HBone, static_cast<float>(g_hud_bones[g_hud_bone].first));
+  } else if (r.b == &g_hud_two_sided) hud.set(selected, g_hud_element, tuner_model::HTwoSided, g_hud_two_sided ? 1.f : 0.f);
+  else if (r.i == &g_hud_frame) hud.frame = g_hud_frame;
+  else {
+    bool found = false;
+    for (int i = 0; i < 8; ++i)
+      if (r.f == &g_hud_vals[i]) { hud.set(selected, g_hud_element, kHudValueField[i], g_hud_vals[i]); found = true; }
+    if (!found) return;
+  }
+  tuner_write(kHudFile, hud.text());
+  hud_show(hud);
+}
+
+// ---- Full-view effects page ------------------------------------------------------------------------------------
+constexpr const wchar_t* kFxFile = L"AvatarVR_fullview_fx.txt";
+int g_fx_index = 0, g_fx_strength = 3, g_fx_seen = 0;
+bool g_fx_on = true;
+float g_fx_size = 1.02f;
+std::vector<tuner_model::Effect> g_fx;
+std::vector<std::pair<int, int>> g_fx_seen_list;
+char g_fx_label_text[tuner_model::kFxMax][64] = {};
+const char* g_fx_labels[tuner_model::kFxMax] = {};
+std::vector<std::string> g_fx_seen_text;
+std::vector<const char*> g_fx_seen_labels;
+char g_fx_status[120] = "Turn on UI > Native HUD on arm and Damage effect fills your view. Changes show within a moment.";
+
+void fx_refresh() {
+  g_fx = tuner_model::parse_effects(tuner_read(kFxFile));
+  g_fx_index = std::clamp(g_fx_index, 0, static_cast<int>(g_fx.size()) - 1);
+  for (size_t i = 0; i < g_fx.size() && i < static_cast<size_t>(tuner_model::kFxMax); ++i) {
+    const auto& e = g_fx[i];
+    snprintf(g_fx_label_text[i], sizeof(g_fx_label_text[i]), "%d, %d  %s%s", static_cast<int>(e.x), static_cast<int>(e.y),
+             tuner_model::effect_name(static_cast<int>(e.x), static_cast<int>(e.y)), e.on != 0.f ? "" : "  (off)");
+    g_fx_labels[i] = g_fx_label_text[i];
+  }
+  const auto& e = g_fx[g_fx_index];
+  g_fx_on = e.on != 0.f;
+  g_fx_strength = std::clamp(static_cast<int>(e.strength), 1, 6);
+  g_fx_size = e.size;
+  g_fx_seen_list = tuner_model::seen_widgets(tuner_read(L"AvatarVR\\state\\AvatarVR_fullview_seen.txt"));
+  g_fx_seen_text.clear();
+  for (const auto& s : g_fx_seen_list) {
+    bool used = false;
+    for (const auto& f : g_fx) used = used || (static_cast<int>(f.x) == s.first && static_cast<int>(f.y) == s.second);
+    g_fx_seen_text.push_back(std::to_string(s.first) + ", " + std::to_string(s.second) + "  " +
+                             tuner_model::effect_name(s.first, s.second) + (used ? "  IN LIST" : ""));
+  }
+  g_fx_seen_labels.clear();
+  for (const auto& s : g_fx_seen_text) g_fx_seen_labels.push_back(s.c_str());
+  if (g_fx_seen_labels.empty()) g_fx_seen_labels.push_back("None seen yet");
+  g_fx_seen = std::clamp(g_fx_seen, 0, static_cast<int>(g_fx_seen_labels.size()) - 1);
+}
+void fx_save() {
+  tuner_write(kFxFile, tuner_model::effects_text(g_fx));
+}
+void act_fx_remove() {
+  if (g_fx.empty()) return;
+  g_fx.erase(g_fx.begin() + g_fx_index);
+  if (g_fx.empty()) {
+    snprintf(g_fx_status, sizeof(g_fx_status), "Kept the last effect: an empty list would turn the default back on.");
+    g_fx.push_back(tuner_model::Effect{});
+    g_fx.back().on = 0.f;
+  }
+  fx_save();
+  g_fx_index = 0;
+  fx_refresh();
+  build_tuner_tab();
+}
+void act_fx_add() {
+  if (g_fx_seen_list.empty() || g_fx_seen >= static_cast<int>(g_fx_seen_list.size())) return;
+  const auto s = g_fx_seen_list[g_fx_seen];
+  for (const auto& f : g_fx)
+    if (static_cast<int>(f.x) == s.first && static_cast<int>(f.y) == s.second) {
+      snprintf(g_fx_status, sizeof(g_fx_status), "That widget is already in the list.");
+      return;
+    }
+  if (static_cast<int>(g_fx.size()) >= tuner_model::kFxMax) {
+    snprintf(g_fx_status, sizeof(g_fx_status), "The list is full: remove one first.");
+    return;
+  }
+  tuner_model::Effect e;
+  e.x = static_cast<float>(s.first);
+  e.y = static_cast<float>(s.second);
+  g_fx.push_back(e);
+  fx_save();
+  g_fx_index = static_cast<int>(g_fx.size()) - 1;
+  snprintf(g_fx_status, sizeof(g_fx_status), "Added %d, %d. Check it fills your view; if HUD art stretches, turn it off.", s.first, s.second);
+  fx_refresh();
+  build_tuner_tab();
+}
+void act_fx_reload() {
+  fx_refresh();
+  build_tuner_tab();
+}
+void build_fx_rows(Tab& t) {
+  fx_refresh();
+  add(t, list_row("Effect", g_fx_status, &g_fx_index, g_fx_labels, static_cast<int>(g_fx.size())));
+  add(t, toggle("On", "Draws this effect across your view instead of in the HUD window.", Target::Tuner, &g_fx_on));
+  add(t, islider("Strength", "More also costs GPU time.", Target::Tuner, &g_fx_strength, 1, 6, "%d"));
+  add(t, tuner_slider("Plane size", "Times your lenses' view. Smaller: further into view; below 1 a hard edge can show.", &g_fx_size,
+                      .7f, 2.f, .01f, "%.2f"));
+  add(t, action("Remove effect", "Takes the selected effect off the list.", &act_fx_remove));
+  add(t, list_row("Seen widget", "Full-size widgets the game has drawn. When a new effect shows up boxed, add its line and check it "
+                  "fills your view. If the aim dot doubles or HUD art stretches, turn that line off.", &g_fx_seen,
+                  g_fx_seen_labels.data(), static_cast<int>(g_fx_seen_labels.size())));
+  add(t, action("Add seen widget", "Adds the selected seen widget to the effect list.", &act_fx_add));
+  add(t, action("Reload lists", "Re-reads the effect list and the widgets the game has drawn.", &act_fx_reload));
+}
+void fx_changed(const Row& r) {
+  if (r.i == &g_fx_index || r.i == &g_fx_seen) {
+    if (r.i == &g_fx_index) fx_refresh();
+    return;
+  }
+  g_fx = tuner_model::parse_effects(tuner_read(kFxFile));
+  if (g_fx_index >= static_cast<int>(g_fx.size())) return;
+  auto& e = g_fx[g_fx_index];
+  if (r.b == &g_fx_on) e.on = g_fx_on ? 1.f : 0.f;
+  else if (r.i == &g_fx_strength) e.strength = static_cast<float>(g_fx_strength);
+  else if (r.f == &g_fx_size) e.size = std::clamp(g_fx_size, .7f, 2.f);
+  else return;
+  fx_save();
+  fx_refresh();
+}
+
+// ---- Tab, dispatch and per-frame work --------------------------------------------------------------------------
+void act_tuner_reload() { build_tuner_tab(); }
+
+void build_tuner_tab() {
+  Tab& t = g_tabs[6];
+  t.name = "Tuner";
+  t.count = 0;
+  add(t, list_row("Page", "The desktop IK tuner's pages. Close that tuner while tuning here: it rewrites the same files.",
+                  &g_tuner_page, kTunerPageLabels, kPageCount));
+  switch (g_tuner_page) {
+    case kPageFingers: build_fingers_rows(t); fingers_refresh(); break;
+    case kPageArms: build_arms_rows(t); break;
+    case kPageHud: build_hud_rows(t); break;
+    default: build_fx_rows(t); break;
+  }
+  add(t, action("Reload from files", "Re-reads the values, e.g. after editing in the desktop tuner.", &act_tuner_reload));
+  if (g_tab == 6 && g_sel >= t.count) g_sel = t.count - 1;
+}
+
+void tuner_changed(const Row& r) {
+  if (r.i == &g_tuner_page) {
+    build_tuner_tab();
+    return;
+  }
+  switch (g_tuner_page) {
+    case kPageFingers: fingers_changed(r); break;
+    case kPageArms: arms_changed(r); break;
+    case kPageHud: hud_changed(r); break;
+    default: fx_changed(r); break;
+  }
+}
+
+// Preview renewal (every second while the menu is open, expires 2 s after the last; ends at once when the menu closes
+// or Preview is switched off, like the desktop tuner's), the capture reply, and the live status line.
+void tuner_poll(bool menu_open, ULONGLONG now) {
+  static bool live = false;
+  static ULONGLONG last = 0, last_capture = 0, last_status = 0;
+  const bool want = menu_open && g_hand_preview;
+  if (want || live) {
+    if (!(want && live && now - last < 1000)) {
+      gesture_edit::File file;
+      if (tune_load(file)) {
+        fingers_preview_keys(file, want);
+        if (tune_save(file)) {
+          live = want;
+          last = now;
+        }
+      }
+    }
+  }
+  if (g_capture_id != 0 && now - last_capture >= 250) {
+    last_capture = now;
+    fingers_capture_poll();
+  }
+  if (menu_open && g_tab == 6 && g_tuner_page == kPageFingers && now - last_status >= 750) {
+    last_status = now;
+    fingers_live_poll();
+  }
 }
 
 void act_reload_scripts() { lua_host::request_reload(); }
@@ -948,7 +1546,7 @@ void build_scripts_tab() {
   add(t, toggle("First-person mounts",
                 "On by default, saved. While mounting, riding and dismounting, the headset view stays on your head "
                 "instead of the game's mount camera behind you; head tracking and controllers keep working. Off: the "
-                "game's mount camera. The first-person arms are not drawn while mounted yet.", Target::None,
+                "game's mount camera.", Target::None,
                 mount_camera::first_person_flag()));
   add(t, toggle("Arms follow controllers while mounted",
                 "On by default, saved. While mounted, the riding body's arms reach for the controllers (needs Arm IK "
@@ -973,7 +1571,7 @@ void build_scripts_tab() {
                 "length and shoulder position so your reach maps onto the Na'vi arms; resets hand position offsets.",
                 &skin_palette_probe::calibrate_arms));
   add(t, toggle("Model-space hands",
-                "On (new): hands are placed relative to your headset and a body-fixed shoulder, like the Cyberpunk VR port, "
+                "On: hands are placed relative to your headset and a body-fixed shoulder, "
                 "so locomotion, bob and turning cannot pull them. Off: previous world-space hands. Saved.",
                 Target::None, skin_palette_probe::model_hands_flag()));
   add(t, toggle("Stabilize hands while moving",
@@ -994,8 +1592,51 @@ void build_scripts_tab() {
                 "line between your hands, pistols are steadied. While both hands hold it, the trigger hand's grip lets go (the gun stays in the "
                 "support hand, no firing) and grips the handle again to re-grab. Grabbing near the trigger hand still swaps hands. Saved.",
                 Target::None, skin_palette_probe::two_hand_flag()));
+  add(t, toggle("Bow string pull",
+                "On: with a bow, grip near the string with your other hand, pull back and open the grip to shoot; a short "
+                "pull is a weak shot. The bow hand's trigger does nothing. Off: the bow hand's trigger fires as in the game. "
+                "On foot only (riding keeps the trigger). Needs Two-hand aiming. Saved.", Target::None, bow_draw::enabled_flag()));
+  add(t, toggle("Bow tension",
+                "Pull distance: how far you pull sets the trigger the game sees. Hold to charge: the trigger is held fully "
+                "while you hold the string and the game builds tension over time. Saved.", Target::None,
+                bow_draw::hold_mode_flag(), "Pull distance", "Hold to charge"));
+  add(t, slider("Bow draw length", "How far you pull back for a full draw. Saved.", Target::None,
+                bow_draw::draw_length_value(), 0.30f, 0.90f, 0.05f, "%.2f m"));
+  add(t, toggle("Bow pull sets shot power",
+                "On: the game's bow charge (shot power) is set from how far you pull instead of filling on its timer. Off: the "
+                "game's timer sets the power. The string you see follows your hand either way. Saved.", Target::None,
+                bow_draw::charge_flag()));
+  add(t, toggle("Bow string follows hand",
+                "On: while you hold the string, the string and arrow are drawn where your hand pulls them, one to one. "
+                "Off: they show the game's own draw. Saved.", Target::None, bow_draw::visual_flag()));
+  add(t, toggle("Bow fires on press",
+                "For bows the game fires on the trigger press: the release sends a short trigger tap instead. Saved.",
+                Target::None, bow_draw::press_fire_flag()));
+  add(t, toggle("Manual reload",
+                "On: reload the assault rifle by hand. Grip the magazine with your free hand and pull it out, let go, grip at "
+                "your free hand's hip for a new one and push it into the gun. After the game reloads an empty gun by itself, "
+                "also pull the charging handle back. The gun does not fire until you finish. The reload button still does "
+                "the game's own reload. Off: the game's reload only. Saved.", Target::None, manual_reload::enabled_flag()));
+  add(t, toggle("Hands pace the game's reload",
+                "On: the game's own reload (its sound, the ammo refill and the HUD) waits for each step of your hands: it "
+                "refills when you push the new magazine in. Off: it runs its own 3.3 s as soon as you grab the magazine. Saved.",
+                Target::None, manual_reload::pace_flag()));
+  add(t, toggle("Hands pace the reload animation",
+                "Experiment. On: the game's reload animation and its sounds wait for each step of your hands (also when "
+                "the game starts a reload by itself on an empty magazine). Needs \"Hands pace the game's reload\". Off: the "
+                "animation plays on its own as soon as the reload starts. Saved.",
+                Target::None, manual_reload::anim_pace_flag()));
   add(t, toggle("Gesture haptics", "A short vibration when a hand enters a gesture zone (shoulder, head). Saved.",
                 Target::None, vr_controls::haptics_flag()));
+  add(t, toggle("Weapon recoil",
+                "On: each shot kicks the gun hand, the gun and the arm together (muzzle up, a little back), stronger for guns "
+                "whose own fire animation is bigger. Visual only: bullets and the aim mark stay where you aim. Bows excluded, "
+                "on foot only. Saved.", Target::None, vr_recoil::enabled_flag()));
+  add(t, slider("Recoil strength", "How hard the gun kicks on each shot. Saved.", Target::None, vr_recoil::strength_value(),
+                0.f, 2.f, 0.1f, "%.1f"));
+  add(t, toggle("Recoil haptic accent",
+                "On: an extra short vibration in the gun hand on each shot, on top of the game's own rumble. Saved.",
+                Target::None, vr_recoil::haptic_flag()));
   add(t, toggle("Movement direction",
                 "Which way the left stick walks. Game: relative to your body (the game's own facing). Head: forward is "
                 "where you look with the headset. Saved.", Target::None, move_probe::head_move_flag(), "Game", "Head"));
@@ -1227,7 +1868,7 @@ void change(Row& r, int dir) {
       if (v < r.zero_below) {
         v = dir > 0 ? r.zero_below : 0.f;  // from "Game"/"Off" the first step right lands on the lowest real value
       } else {
-        v = std::round((v + dir * r.step) / r.step) * r.step;
+        v = r.snap ? std::round((v + dir * r.step) / r.step) * r.step : v + dir * r.step;
         if (v < r.zero_below - 1e-4f) {
           v = 0.f;
         } else {
@@ -1245,6 +1886,10 @@ void change(Row& r, int dir) {
         r.action();
       }
       return;
+  }
+  if (r.target == Target::Tuner) {
+    tuner_changed(r);
+    return;
   }
   if (r.target == Target::Native) {
     g_dirty_native = true;
@@ -1938,7 +2583,7 @@ void value_text(const Row& r, char* out, size_t n) {
       snprintf(out, n, "%s", r.choices[*r.b ? 1 : 0]);
       break;
     case Kind::Choice:
-      snprintf(out, n, "%s", r.choices[std::clamp(*r.i, 0, r.choice_count - 1)]);
+      snprintf(out, n, "%s", (r.list != nullptr ? r.list : r.choices)[std::clamp(*r.i, 0, r.choice_count - 1)]);
       break;
     case Kind::Int:
       snprintf(out, n, r.fmt, *r.i);
@@ -2060,7 +2705,7 @@ void draw_menu(const Painter& P) {
         }
       }
     }
-    tx += w + 46.f;
+    tx += w + 32.f;
   }
   P.text(g_font, 22.f, 1200.f - P.width(g_font, 22.f, "PgUp / PgDn"), 84.f, rgba(170, 190, 240, 150), "PgUp / PgDn");
 
@@ -2355,6 +3000,7 @@ void on_present(IDXGISwapChain* swapchain) {
     g_log_path = g_dir + L"\\VR_MENU.log";
     build_tabs();
     build_scripts_tab();
+    build_tuner_tab();
     load_settings();
     wrist_hud::load(g_dir.c_str());
     log_line("vr menu build %s %s: F10 toggles", __DATE__, __TIME__);
@@ -2401,7 +3047,7 @@ void on_present(IDXGISwapChain* swapchain) {
   }
   if (poll_key(g_keys[kF9], focused, false, now)) {
     frame_capture::request_eyes();
-    log_line("F9: eye capture requested (scripts\\captures\\eyes_*.jpg)");
+    log_line("F9: eye capture requested (scripts\\AvatarVR\\captures\\eyes_*.jpg)");
   }
   const int xr_events = xr_input::take_menu_events();
   const bool xr_toggle = ((xr_events & xr_input::kMenuOpen) != 0 && !g_visible) ||
@@ -2410,6 +3056,7 @@ void on_present(IDXGISwapChain* swapchain) {
     g_visible = !g_visible;
     if (g_visible) {
       load_settings();
+      build_tuner_tab();  // files may have changed while the menu was closed
       xr_runtime::recentre_overlay();
       log_line("menu opened (stereo=%d head=%d fov=%.1f offy=%.2f xr=%d proj=%d)", g_s.stereo ? 1 : 0, g_s.head ? 1 : 0, g_s.fov,
                g_s.offy, g_s.xr ? 1 : 0, g_s.proj ? 1 : 0);
@@ -2418,6 +3065,7 @@ void on_present(IDXGISwapChain* swapchain) {
     }
   }
   handle_input(focused, now);
+  tuner_poll(g_visible, now);
   xr_input::set_menu_open(g_visible);  // the game gets a neutral pad while the menu has the controllers
   if (g_dirty_native) {
     g_dirty_native = false;

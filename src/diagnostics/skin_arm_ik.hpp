@@ -206,7 +206,7 @@ inline Vec scale_reach(Vec grip, Vec user_shoulder, Vec navi_shoulder, float nav
   if (!std::isfinite(factor) || factor <= 0.f) return grip;
   return add(navi_shoulder, scale(sub(grip, user_shoulder), factor));
 }
-// Model-space hand target (2026-10-16, after the Cyberpunk VR port's VRIK_BuildHandTarget): the controller is taken
+// Model-space hand target (2026-10-16): the controller is taken
 // relative to the headset (grip - head, both from the same sample, so the game camera's bob and position cancel),
 // minus the user's calibrated shoulder offset from the headset (body axes of `basis`), scaled to the Na'vi arm and
 // added to the Na'vi shoulder: target = navi_shoulder + (hmd_rel - user_shoulder_rel) * factor (factor 1 when off).
@@ -287,7 +287,7 @@ inline Vec soft_reach_point(Vec target, Vec shoulder, float limit, float knee_sh
   const float r = soft_reach(l, limit, knee_share);
   return add(shoulder, scale(d, r / l));
 }
-// Elbow swivel smoothing (2026-11-13, after the Cyberpunk VR port: only the elbow is smoothed). The pole direction is
+// Elbow-only swivel smoothing (2026-11-13). The pole direction is
 // filtered with time constant tau; the wrist is not touched, so the hand gets no extra latency.
 struct PoleFilter {
   Vec v{0.f, 0.f, 0.f};

@@ -5,7 +5,7 @@
 # Started by tools\run_cycle.ps1 once afop.exe is running. By hand:  powershell -File tools\perf\run_fingerprint.ps1
 # Compare runs with:  python tools\perf\runs_report.py
 param(
-  [string]$Game = 'H:\Gaming\UbisoftLibrary\AFOP',
+  [Parameter(Mandatory)][string]$Game,
   [string]$LogPath = ''
 )
 $ErrorActionPreference = 'Continue'
@@ -77,7 +77,7 @@ try {
 
 Section 'other programs that can use the GPU or hook the game'
 try {
-  $pattern = 'OFXR|VectorXR|Razer|Cortex|GameBar|ShadowPlay|nvcontainer|NVIDIA|sunshine|obs64|Medal|Overwolf|Discord|steam|upc|Uplay|VirtualDesktop|VRNexus|chrome|msedge|firefox|SearchHost|Widgets|Teams|RTSS|MSIAfterburner|PresentMon|HWiNFO|wallpaper'
+  $pattern = 'OFXR|Razer|Cortex|GameBar|ShadowPlay|nvcontainer|NVIDIA|sunshine|obs64|Medal|Overwolf|Discord|steam|upc|Uplay|VirtualDesktop|chrome|msedge|firefox|SearchHost|Widgets|Teams|RTSS|MSIAfterburner|PresentMon|HWiNFO|wallpaper'
   Get-Process | Where-Object { $_.ProcessName -match $pattern } | Group-Object ProcessName | Sort-Object Name |
     ForEach-Object { Add ('program {0} x{1}' -f $_.Name, $_.Count) }
 } catch {}

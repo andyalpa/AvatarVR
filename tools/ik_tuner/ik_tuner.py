@@ -6,6 +6,8 @@ headset shows the change almost immediately. Keys are prefixed "tp." (third-pers
 for the first-person rig. Rotation values left on "inherit" use the first-person hand tune. Mounted position offsets
 start at zero and are authored here; side is mirrored automatically. This tool writes the tune file and saved presets.
 """
+import io
+import settings_store
 import argparse
 import json
 import math
@@ -107,7 +109,7 @@ def read_arms(scripts):
 def read_kv(path, sep):
     out = {}
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with io.StringIO(settings_store.read(path)) as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -375,8 +377,7 @@ class GestureEditor:
 
     def prefs(self):
         try:
-            with open(self.prefs_path(), encoding="utf-8") as file:
-                data = json.load(file)
+            data = json.loads(settings_store.read(self.prefs_path()))
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
@@ -384,8 +385,7 @@ class GestureEditor:
     def mirror_toggled(self):
         data = self.prefs(); data["mirror_hands"] = bool(self.mirror.get())
         try:
-            with open(self.prefs_path(), "w", encoding="utf-8") as file:
-                json.dump(data, file)
+            settings_store.write(self.prefs_path(), json.dumps(data))
         except OSError:
             pass
         if self.mirror.get():
@@ -486,7 +486,7 @@ class GestureEditor:
             self.app.write()
             return
         try:
-            with open(os.path.join(self.app.scripts, "AvatarVR_gesture_capture.json"), encoding="utf-8") as file:
+            with open(os.path.join(self.app.scripts, "AvatarVR", "state", "AvatarVR_gesture_capture.json"), encoding="utf-8") as file:
                 payload = json.load(file)
         except (OSError, ValueError):
             return
@@ -513,7 +513,7 @@ class GestureEditor:
 
     def poll(self):
         try:
-            with open(os.path.join(self.app.scripts, "AvatarVR_gesture_status.json"), encoding="utf-8") as file:
+            with open(os.path.join(self.app.scripts, "AvatarVR", "state", "AvatarVR_gesture_status.json"), encoding="utf-8") as file:
                 status = json.load(file)
             if time.time() - status["at"] > 3:
                 raise ValueError("stale")
@@ -655,11 +655,8 @@ class App:
         self.root.destroy()
 
     def write(self):
-        tmp = self.path + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8", newline="") as f:
-                f.write(self.text())
-            os.replace(tmp, self.path)
+            settings_store.write(self.path, self.text())
             self.status.set("Live: written " + time.strftime("%H:%M:%S"))
         except OSError as e:
             self.status.set("Write failed: %s" % e)
